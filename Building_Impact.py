@@ -1,182 +1,21 @@
 import geopandas as gpd
 import pandas as pd
 from pathlib import Path
-import osmium
 import shapely.wkb as wkblib
-from shapely.geometry import Point, LineString
 
 #@profile
-class CriticalInfrastructureExtractor(osmium.SimpleHandler):
-    """Extract critical infrastructure from PBF file using specific OSM tags - OPTIMIZED."""
-
-    def __init__(self, bbox=None):
-        osmium.SimpleHandler.__init__(self)
-        self.structures = []
-        self.processed_count = 0
-        self.bbox_tuple = bbox  # Cache as tuple for faster access
-
-        # Use frozenset for O(1) membership testing (faster than set)
-        self.aeroway_values = frozenset(['runway'])
-
-        self.amenity_values = frozenset([
-            'college', 'university', 'doctors', 'hospital',
-            'fire_station', 'police', 'townhall'
-        ])
-
-        self.building_values = frozenset([
-            'college', 'fire_station', 'government', 'hospital',
-            'school', 'university', 'military'
-        ])
-
-        self.man_made_values = frozenset(['water_works', 'water_well'])
-
-        self.military_values = frozenset(['airfield', 'base'])
-
-        self.power_values = frozenset(['plant'])
-
-        self.waterway_values = frozenset(['dam'])
-
-    def _in_bbox(self, lon, lat):
-        """Quick bounding box check - optimized."""
-        if self.bbox_tuple is None:
-            return True
-        return (self.bbox_tuple[0] <= lon <= self.bbox_tuple[2] and
-                self.bbox_tuple[1] <= lat <= self.bbox_tuple[3])
-
-    def _check_feature_fast(self, tags_dict):
-        """
-        Optimized feature checking with early returns and frozenset lookups.
-        Returns (is_valid, tag_type, tag_value)
-        """
-        # Check in order of rarity (rarest first = faster elimination)
-        aeroway = tags_dict.get('aeroway')
-        if aeroway in self.aeroway_values:  # frozenset membership is O(1)
-            return True, 'aeroway', aeroway
-
-        amenity = tags_dict.get('amenity')
-        if amenity in self.amenity_values:
-            return True, 'amenity', amenity
-
-        building = tags_dict.get('building')
-        if building in self.building_values:
-            return True, 'building', building
-
-        man_made = tags_dict.get('man_made')
-        if man_made in self.man_made_values:
-            return True, 'man_made', man_made
-
-        military = tags_dict.get('military')
-        if military in self.military_values:
-            return True, 'military', military
-
-        power = tags_dict.get('power')
-        if power in self.power_values:
-            return True, 'power', power
-
-        waterway = tags_dict.get('waterway')
-        if waterway in self.waterway_values:
-            return True, 'waterway', waterway
-
-        return False, None, None
-
-    def node(self, n):
-        """Extract point features - optimized."""
-        # Update counter every 5M instead of 1M to reduce overhead
-        self.processed_count += 1
-        if self.processed_count % 5000000 == 0:
-            print(f"  Processed {self.processed_count:,} features, found {len(self.structures):,} structures...",
-                  end='\r')
-
-        # Quick bbox check
-        try:
-            if not self._in_bbox(n.location.lon, n.location.lat):
-                return
-        except:
-            return
-
-        # Convert tags to dict ONCE
-        tags = dict(n.tags)
-        is_valid, tag_type, tag_value = self._check_feature_fast(tags)
-
-        if is_valid:
-            self.structures.append({
-                'geometry': Point(n.location.lon, n.location.lat),
-                'tag_type': tag_type,
-                'infrastructure_type': tag_value,
-                'osm_id': n.id,
-                'name': tags.get('name', ''),  # Use cached tags dict
-                'feature_class': 'node'
-            })
-
-    def way(self, w):
-        """Extract way features - optimized."""
-        self.processed_count += 1
-        if self.processed_count % 500000 == 0:
-            print(f"  Processed {self.processed_count:,} features, found {len(self.structures):,} structures...",
-                  end='\r')
-
-        # Convert tags to dict ONCE
-        tags = dict(w.tags)
-        is_valid, tag_type, tag_value = self._check_feature_fast(tags)
-
-        if is_valid:
-            try:
-                # Build coordinates list efficiently using list comprehension
-                coords = [(node.lon, node.lat) for node in w.nodes if node.location.valid()]
-
-                if len(coords) >= 2:
-                    geometry = LineString(coords)
-
-                    self.structures.append({
-                        'geometry': geometry,
-                        'tag_type': tag_type,
-                        'infrastructure_type': tag_value,
-                        'osm_id': w.id,
-                        'name': tags.get('name', ''),  # Use cached tags dict
-                        'feature_class': 'way'
-                    })
-            except:
-                pass
-
-    def area(self, a):
-        """Extract area/polygon features - optimized."""
-        self.processed_count += 1
-        if self.processed_count % 500000 == 0:
-            print(f"  Processed {self.processed_count:,} features, found {len(self.structures):,} structures...",
-                  end='\r')
-
-        # Convert tags to dict ONCE
-        tags = dict(a.tags)
-        is_valid, tag_type, tag_value = self._check_feature_fast(tags)
-
-        if is_valid:
-            try:
-                wkb = wkblib.loads(a.wkb, hex=True)
-
-                self.structures.append({
-                    'geometry': wkb,
-                    'tag_type': tag_type,
-                    'infrastructure_type': tag_value,
-                    'osm_id': a.id,
-                    'name': tags.get('name', ''),  # Use cached tags dict
-                    'feature_class': 'area'
-                })
-            except:
-                pass
-
-@profile
-def calculate_basin_infrastructure_from_pbf(basin_file, pbf_files, output_folder):
+def calculate_basin_infrastructure_from_parquet(basin_file, infrastructure_parquet, output_folder):
     """
-    Calculate critical infrastructure statistics from PBF file(s).
-    Creates CSV with statistics and a shapefile for visualization.
-    OPTIMIZED VERSION.
+    Calculate critical infrastructure statistics from infrastructure parquet file.
+    Uses vectorized operations for fast processing.
+    FULLY OPTIMIZED - NO LOOPS.
 
     Parameters:
     -----------
     basin_file : str
-        Path to basin shapefile or parquet file
-    pbf_files : str or list
-        Path to PBF file, folder of PBF files, or list of files
+        Path to basin parquet file
+    infrastructure_parquet : str
+        Path to infrastructure parquet file with OSM data
     output_folder : str
         Path to output folder (will be created if it doesn't exist)
     """
@@ -188,92 +27,178 @@ def calculate_basin_infrastructure_from_pbf(basin_file, pbf_files, output_folder
 
     # Define output files
     output_csv = output_path / "infrastructure_statistics.csv"
-    output_shapefile = output_path / "infrastructure_affected.shp"
+    output_gpkg = output_path / "infrastructure_affected.gpkg"
 
-    # Read basins
+    # ===== READ BASINS =====
+    print("\nReading basin data...")
     basin_path = Path(basin_file)
-    print(f"\nReading basin data from {basin_path.suffix} file...")
+    if not basin_path.exists():
+        raise FileNotFoundError(f"Basin file not found: {basin_path}")
 
-    if basin_path.suffix == '.parquet':
-        # Read parquet with fastparquet for better performance
-        df = pd.read_parquet(basin_file, engine='fastparquet')
-        # Convert WKB geometry column to shapely geometries
-        df['geometry'] = df['geometry'].apply(lambda x: wkblib.loads(x, hex=True) if isinstance(x, str) else wkblib.loads(x))
-        basins = gpd.GeoDataFrame(df, geometry='geometry', crs="EPSG:4326")
-    elif basin_path.suffix in ['.shp', '.geojson', '.gpkg']:
-        basins = gpd.read_file(basin_file)
-    else:
-        raise ValueError(f"Unsupported file format: {basin_path.suffix}")
+    try:
+        basins_df = pd.read_parquet(basin_file, engine='fastparquet')
+        print("  Using fastparquet engine")
+    except Exception as e:
+        print(f"  ⚠ fastparquet failed: {str(e)}")
+        print("  Falling back to pyarrow engine...")
+        basins_df = pd.read_parquet(basin_file, engine='pyarrow')
 
+    # Convert WKB geometry to shapely
+    print("  Converting geometries...")
+    if 'geometry' in basins_df.columns:
+        first_geom = basins_df['geometry'].iloc[0]
+
+        # Check what type it is
+        if isinstance(first_geom, (str, bytes)):
+            # String or bytes - need WKB conversion
+            basins_df['geometry'] = basins_df['geometry'].apply(
+                lambda x: wkblib.loads(x, hex=True) if isinstance(x, str) else wkblib.loads(x)
+            )
+        # else it's already a geometry object, no conversion needed
+
+    basins = gpd.GeoDataFrame(basins_df, geometry='geometry', crs="EPSG:4326")
     print(f"Loaded {len(basins)} basins")
 
-    # Get bounding box of basins
-    if basins.crs.to_epsg() != 4326:
-        basins_wgs84 = basins.to_crs("EPSG:4326")
-    else:
-        basins_wgs84 = basins
+    # ===== READ INFRASTRUCTURE PARQUET =====
+    print("\nReading infrastructure parquet...")
+    infra_path = Path(infrastructure_parquet)
+    if not infra_path.exists():
+        raise FileNotFoundError(f"Infrastructure parquet file not found: {infra_path}")
 
-    bbox = basins_wgs84.total_bounds
-    print(f"Basin bounding box: {bbox}")
+    try:
+        infra_df = pd.read_parquet(infrastructure_parquet, engine='fastparquet')
+        print("  Using fastparquet engine")
+    except Exception as e:
+        print(f"  ⚠ fastparquet failed: {str(e)}")
+        print("  Falling back to pyarrow engine...")
+        infra_df = pd.read_parquet(infrastructure_parquet, engine='pyarrow')
 
-    # Find PBF files
-    if isinstance(pbf_files, str):
-        pbf_path = Path(pbf_files)
-        if pbf_path.is_dir():
-            files = list(pbf_path.glob("*.osm.pbf")) + list(pbf_path.glob("*.pbf"))
-        else:
-            files = [pbf_path]
-    else:
-        files = [Path(f) for f in pbf_files]
+    # Convert WKB geometry to shapely if needed
+    print("  Converting geometries...")
+    if 'geometry' in infra_df.columns:
+        first_geom = infra_df['geometry'].iloc[0]
 
-    if not files:
-        raise FileNotFoundError("No PBF files found")
+        # Check what type it is
+        if isinstance(first_geom, (str, bytes)):
+            # String or bytes - need WKB conversion
+            infra_df['geometry'] = infra_df['geometry'].apply(
+                lambda x: wkblib.loads(x, hex=True) if isinstance(x, str) else wkblib.loads(x)
+            )
+        # else it's already a geometry object, no conversion needed
 
-    print(f"Found {len(files)} PBF file(s) to process")
+    infrastructure = gpd.GeoDataFrame(infra_df, geometry='geometry', crs="EPSG:4326")
+    print(f"  Loaded {len(infrastructure):,} infrastructure features")
 
-    # Extract infrastructure from all PBF files
-    all_infrastructure = []
+    # ===== VECTORIZED FILTERING =====
+    print("\nFiltering for critical infrastructure types...")
 
-    for pbf_file in files:
-        print(f"\nExtracting critical infrastructure from: {pbf_file.name}")
+    # Start with a DataFrame of False values
+    filter_criteria = pd.Series([False] * len(infrastructure), index=infrastructure.index)
 
-        handler = CriticalInfrastructureExtractor(bbox=bbox)
-        handler.apply_file(str(pbf_file), locations=True)
+    # Add each criterion if the column exists
+    if 'aeroway' in infrastructure.columns:
+        filter_criteria |= (infrastructure['aeroway'] == 'runway')
 
-        print(f"\n  Found {len(handler.structures):,} infrastructure features in bounding box")
+    if 'amenity' in infrastructure.columns:
+        filter_criteria |= infrastructure['amenity'].isin([
+            'college', 'university', 'doctors', 'hospital',
+            'fire_station', 'police', 'townhall'
+        ])
 
-        if handler.structures:
-            all_infrastructure.extend(handler.structures)
+    if 'building' in infrastructure.columns:
+        filter_criteria |= infrastructure['building'].isin([
+            'college', 'fire_station', 'government', 'hospital',
+            'school', 'university', 'military'
+        ])
 
-    if not all_infrastructure:
-        print("\nWarning: No infrastructure found in PBF files within basin area!")
+    if 'man_made' in infrastructure.columns:
+        filter_criteria |= infrastructure['man_made'].isin(['water_works', 'water_well'])
+
+    if 'military' in infrastructure.columns:
+        filter_criteria |= infrastructure['military'].isin(['airfield', 'base'])
+
+    if 'power' in infrastructure.columns:
+        filter_criteria |= (infrastructure['power'] == 'plant')
+
+    if 'waterway' in infrastructure.columns:
+        filter_criteria |= (infrastructure['waterway'] == 'dam')
+
+    # Apply filter
+    infrastructure_filtered = infrastructure[filter_criteria].copy()
+    print(f"Filtered to {len(infrastructure_filtered):,} critical infrastructure features")
+
+    if len(infrastructure_filtered) == 0:
+        print("\nWarning: No critical infrastructure found!")
         result = pd.DataFrame({
             'category': ['TOTAL'],
             'infrastructure_type': ['All Infrastructure'],
             'count': [0]
         })
+        result.to_csv(output_csv, index=False)
         return result
 
-    # Convert to GeoDataFrame
-    print(f"\nConverting {len(all_infrastructure):,} infrastructure features to GeoDataFrame...")
-    infrastructure = gpd.GeoDataFrame(all_infrastructure, crs="EPSG:4326")
-    print(f"Total infrastructure extracted: {len(infrastructure):,}")
+    # ===== VECTORIZED TAG TYPE ASSIGNMENT =====
+    print("\nAssigning tag types...")
 
-    # Show what we found
+    def assign_tag_type(row):
+        """Vectorized tag type assignment - handles missing columns."""
+        # Check aeroway
+        if 'aeroway' in row and pd.notna(row['aeroway']) and row['aeroway'] == 'runway':
+            return 'aeroway', row['aeroway']
+        # Check amenity
+        elif 'amenity' in row and pd.notna(row['amenity']) and row['amenity'] in [
+            'college', 'university', 'doctors', 'hospital', 'fire_station', 'police', 'townhall'
+        ]:
+            return 'amenity', row['amenity']
+        # Check building
+        elif 'building' in row and pd.notna(row['building']) and row['building'] in [
+            'college', 'fire_station', 'government', 'hospital', 'school', 'university', 'military'
+        ]:
+            return 'building', row['building']
+        # Check man_made
+        elif 'man_made' in row and pd.notna(row['man_made']) and row['man_made'] in ['water_works', 'water_well']:
+            return 'man_made', row['man_made']
+        # Check military
+        elif 'military' in row and pd.notna(row['military']) and row['military'] in ['airfield', 'base']:
+            return 'military', row['military']
+        # Check power
+        elif 'power' in row and pd.notna(row['power']) and row['power'] == 'plant':
+            return 'power', row['power']
+        # Check waterway
+        elif 'waterway' in row and pd.notna(row['waterway']) and row['waterway'] == 'dam':
+            return 'waterway', row['waterway']
+        else:
+            return None, None
+
+    # Apply vectorized assignment
+    infrastructure_filtered[['tag_type', 'infrastructure_type']] = infrastructure_filtered.apply(
+        assign_tag_type, axis=1, result_type='expand'
+    )
+
+    # Remove any rows where assignment failed
+    infrastructure_filtered = infrastructure_filtered[infrastructure_filtered['tag_type'].notna()].copy()
+
+    # ===== SHOW BREAKDOWN =====
     print("\nBreakdown by tag type:")
-    print(infrastructure['tag_type'].value_counts())
+    print(infrastructure_filtered['tag_type'].value_counts())
 
     print("\nInfrastructure types found:")
-    print(infrastructure['infrastructure_type'].value_counts())
+    print(infrastructure_filtered['infrastructure_type'].value_counts())
 
-    # Reproject to match basins
-    if infrastructure.crs != basins.crs:
-        print(f"\nReprojecting infrastructure to {basins.crs}...")
-        infrastructure = infrastructure.to_crs(basins.crs)
-
-    # Spatial join
+    # ===== SPATIAL JOIN WITH BASINS =====
     print("\nIntersecting infrastructure with basins...")
-    infrastructure_in_basins = gpd.sjoin(infrastructure, basins, how='inner', predicate='intersects')
+
+    # Ensure same CRS
+    if infrastructure_filtered.crs != basins.crs:
+        infrastructure_filtered = infrastructure_filtered.to_crs(basins.crs)
+
+    # Vectorized spatial join
+    infrastructure_in_basins = gpd.sjoin(
+        infrastructure_filtered,
+        basins,
+        how='inner',
+        predicate='intersects'
+    )
 
     print(f"Infrastructure within basins: {len(infrastructure_in_basins):,}")
 
@@ -284,71 +209,65 @@ def calculate_basin_infrastructure_from_pbf(basin_file, pbf_files, output_folder
             'infrastructure_type': ['All Infrastructure'],
             'count': [0]
         })
-        # Define defaults so later code can reference these variables safely
         total_infrastructure = 0
         tag_type_counts = {}
-        type_counts = pd.DataFrame({'infrastructure_type': [], 'count': []})
+        type_counts = pd.DataFrame()
     else:
-        # === EXPORT SPATIAL FILES ===
-        print(f"\nPreparing infrastructure features for export...")
+        # ===== EXPORT GEOPACKAGE =====
+        print(f"\n1. Saving infrastructure to GeoPackage (as point centroids)...")
 
-        # Reproject back to WGS84 for Shapefile
+        # Reproject to WGS84
         infrastructure_for_export = infrastructure_in_basins.to_crs("EPSG:4326")
 
-        # Select columns for export
-        export_columns = [
-            'tag_type',
-            'infrastructure_type',
-            'name',
-            'osm_id',
-            'geometry'
-        ]
+        # Select columns
+        export_columns = ['tag_type', 'infrastructure_type', 'name', 'osm_id', 'geometry']
 
-        infrastructure_export = infrastructure_for_export[export_columns].copy()
+        # Handle missing columns gracefully
+        available_cols = [col for col in export_columns if col in infrastructure_for_export.columns]
+        if 'geometry' not in available_cols:
+            available_cols.append('geometry')
 
-        # Save to Shapefile (convert to point centroids)
-        print(f"\n1. Saving infrastructure to Shapefile (as point centroids)...")
-        infrastructure_shp = infrastructure_export.copy()
-        infrastructure_shp = infrastructure_shp.rename(columns={
-            'tag_type': 'tag_type',
-            'infrastructure_type': 'infra_type',
-            'name': 'name',
-            'osm_id': 'osm_id'
-        })
+        infrastructure_export = infrastructure_for_export[available_cols].copy()
 
-        # Convert all geometries to centroids (points)
-        infrastructure_shp['geometry'] = infrastructure_shp.geometry.centroid
+        # Convert to centroids - use projected CRS for accurate centroid calculation
+        # First reproject to a suitable projected CRS (UTM zone for the region)
+        # For Central America, UTM Zone 16N (EPSG:32616) is appropriate
+        try:
+            # Try to use UTM Zone 16N for Central America
+            infrastructure_projected = infrastructure_export.to_crs("EPSG:32616")
+            infrastructure_export['geometry'] = infrastructure_projected.geometry.centroid
+            # Reproject centroids back to WGS84
+            infrastructure_export = infrastructure_export.to_crs("EPSG:4326")
+        except Exception as e:
+            # Fallback: calculate centroids in geographic CRS (less accurate but works)
+            print(f"  ⚠ Could not use projected CRS: {str(e)}")
+            print("  Falling back to geographic CRS centroids (less accurate)")
+            infrastructure_export['geometry'] = infrastructure_export.geometry.centroid
 
-        infrastructure_shp.to_file(output_shapefile)
-        print(f"   ✓ {output_shapefile.name}")
-        print(f"     Features: {len(infrastructure_shp):,}")
-        print(f"     Note: All features converted to point centroids")
+        # Save to GeoPackage (no field name length limits!)
+        infrastructure_export.to_file(output_gpkg, driver='GPKG', layer='infrastructure')
+        print(f"   ✓ {output_gpkg.name}")
+        print(f"     Features: {len(infrastructure_export):,}")
+        print(f"     Layer: infrastructure")
 
-        # === CALCULATE STATISTICS ===
+        # ===== CALCULATE STATISTICS (VECTORIZED) =====
         total_infrastructure = len(infrastructure_in_basins)
 
-        # Count by tag type
-        tag_type_counts = infrastructure_in_basins.groupby('tag_type').size().to_dict()
+        # Count by tag type (vectorized)
+        tag_type_counts = infrastructure_in_basins['tag_type'].value_counts().to_dict()
 
-        # Count by each specific infrastructure type
+        # Count by infrastructure type (vectorized)
         type_counts = infrastructure_in_basins['infrastructure_type'].value_counts().reset_index()
         type_counts.columns = ['infrastructure_type', 'count']
         type_counts = type_counts.sort_values('infrastructure_type').reset_index(drop=True)
-
-        # Add category column for detailed rows
         type_counts['category'] = 'DETAIL'
 
         # Create summary rows
-        summary_rows = []
+        summary_rows = [
+            {'category': 'TOTAL', 'infrastructure_type': 'All Critical Infrastructure', 'count': total_infrastructure}
+        ]
 
-        # Overall total
-        summary_rows.append({
-            'category': 'TOTAL',
-            'infrastructure_type': 'All Critical Infrastructure',
-            'count': total_infrastructure
-        })
-
-        # Subtotals by tag type
+        # Add subtotals
         for tag_type in sorted(tag_type_counts.keys()):
             summary_rows.append({
                 'category': 'SUBTOTAL',
@@ -358,10 +277,13 @@ def calculate_basin_infrastructure_from_pbf(basin_file, pbf_files, output_folder
 
         summary_df = pd.DataFrame(summary_rows)
 
-        # Combine: summaries first, then details
-        result = pd.concat([summary_df, type_counts[['category', 'infrastructure_type', 'count']]],
-                           ignore_index=True)
+        # Combine
+        result = pd.concat(
+            [summary_df, type_counts[['category', 'infrastructure_type', 'count']]],
+            ignore_index=True
+        )
 
+        # Print breakdown
         print("\n" + "=" * 60)
         print("Critical infrastructure breakdown by tag type:")
         print("=" * 60)
@@ -373,19 +295,20 @@ def calculate_basin_infrastructure_from_pbf(basin_file, pbf_files, output_folder
         for _, row in type_counts.iterrows():
             print(f"  {row['infrastructure_type']}: {row['count']:,}")
 
-    # Save statistics to CSV
+    # ===== SAVE CSV =====
     print(f"\n2. Saving statistics CSV...")
     result.to_csv(output_csv, index=False)
     print(f"   ✓ {output_csv.name}")
 
-    # Print final summary
+    # ===== FINAL SUMMARY =====
     print("\n" + "=" * 60)
     print("CRITICAL INFRASTRUCTURE STATISTICS")
     print("=" * 60)
     print(f"Total critical infrastructure: {total_infrastructure:,}")
-    print(f"Unique infrastructure types: {len(type_counts)}")
+    if len(type_counts) > 0:
+        print(f"Unique infrastructure types: {len(type_counts)}")
     print(f"\nFiles created in: {output_path}")
-    print("  1. infrastructure_affected.shp (point centroids)")
+    print("  1. infrastructure_affected.gpkg (point centroids)")
     print("  2. infrastructure_statistics.csv")
     print("=" * 60)
 
@@ -395,14 +318,13 @@ def calculate_basin_infrastructure_from_pbf(basin_file, pbf_files, output_folder
 # Usage
 if __name__ == "__main__":
     basin_file = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\catchments_718.parquet"
-    pbf_files = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\OSM\central-america-260204.osm.pbf"
+    infrastructure_parquet = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\OSM_Parquet\central-america.parquet"
 
-    # Output folder
     output_folder = r"C:\C_Drive_Brians_Stuff\Python_Projects\Critical_Infrastructure_Impact"
 
-    results = calculate_basin_infrastructure_from_pbf(
+    results = calculate_basin_infrastructure_from_parquet(
         basin_file,
-        pbf_files,
+        infrastructure_parquet,
         output_folder
     )
 

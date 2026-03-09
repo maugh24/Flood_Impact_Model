@@ -1,109 +1,23 @@
 import geopandas as gpd
 import pandas as pd
 from pathlib import Path
-import osmium
 import shapely.wkb as wkblib
-from shapely.geometry import LineString
-import warnings
-warnings.filterwarnings('ignore')
+from shapely.geometry import LineString, Point
+import numpy as np
 
 
-class TransportationExtractor(osmium.SimpleHandler):
-    """Extract road and railway features from PBF file using specific OSM tags."""
-
-    def __init__(self, bbox=None):
-        osmium.SimpleHandler.__init__(self)
-        self.features = []
-        self.processed_count = 0
-        self.bbox_tuple = bbox  # Cache as tuple for faster access
-
-        # Use frozenset for O(1) membership testing (faster than set)
-        self.highway_values = frozenset([
-            'motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'residential',
-            'motorway_link', 'trunk_link', 'primary_link', 'secondary_link', 'tertiary_link',
-            'living_street', 'busway', 'footway', 'cycleway'
-        ])
-
-        # Use frozenset for O(1) membership testing (faster than set)
-        self.railway_values = frozenset([
-            'light_rail', 'monorail', 'rail', 'subway', 'tram'
-        ])
-
-    def _in_bbox(self, nodes):
-        """Check if any node in the way is within bounding box."""
-        if self.bbox_tuple is None:
-            return True
-
-        for node in nodes:
-            try:
-                # Check if node has valid location
-                if node.location.valid():
-                    if (self.bbox_tuple[0] <= node.lon <= self.bbox_tuple[2] and
-                            self.bbox_tuple[1] <= node.lat <= self.bbox_tuple[3]):
-                        return True
-            except:
-                # Skip nodes with invalid locations
-                continue
-
-        return False
-
-    def way(self, w):
-        """Extract road and railway ways (linear features)."""
-        self.processed_count += 1
-        if self.processed_count % 100000 == 0:
-            print(f"  Processed {self.processed_count:,} ways, found {len(self.features):,} features...", end='\r')
-
-        # Check if this is a highway or railway we want
-        highway = w.tags.get('highway')
-        railway = w.tags.get('railway')
-
-        feature_type = None
-        feature_value = None
-
-        # Prioritize highway, then railway
-        if highway and highway in self.highway_values:
-            feature_type = 'highway'
-            feature_value = highway
-        elif railway and railway in self.railway_values:
-            feature_type = 'railway'
-            feature_value = railway
-
-        if feature_type and feature_value:
-            # Check bounding box
-            if not self._in_bbox(w.nodes):
-                return
-
-            try:
-                # Create LineString from nodes - optimized with list comprehension
-                coords = [(node.lon, node.lat) for node in w.nodes
-                         if node.location.valid()]
-
-                if len(coords) >= 2:  # Need at least 2 points for a line
-                    geometry = LineString(coords)
-
-                    self.features.append({
-                        'geometry': geometry,
-                        'infrastructure_type': feature_type,  # 'highway' or 'railway'
-                        'feature_value': feature_value,  # specific type (e.g., 'primary', 'rail')
-                        'osm_id': w.id,
-                        'name': w.tags.get('name', ''),
-                        'ref': w.tags.get('ref', '')  # Reference number
-                    })
-            except Exception as e:
-                pass  # Skip invalid geometries
-
-#@profile
-def calculate_basin_transportation_from_pbf(basin_file, pbf_files, output_folder):
+def calculate_basin_transportation_from_parquet(basin_file, transportation_parquet, output_folder):
     """
-    Calculate road and railway length statistics from PBF file(s).
-    Saves CSV statistics and separate shapefiles for motorways, other highways, and railways.
+    Calculate transportation infrastructure statistics from transportation parquet file.
+    Reconstructs LineStrings from points and calculates lengths.
+    Uses vectorized operations for fast processing.
 
     Parameters:
     -----------
     basin_file : str
-        Path to basin shapefile or parquet file
-    pbf_files : str or list
-        Path to PBF file, folder of PBF files, or list of files
+        Path to basin parquet file
+    transportation_parquet : str
+        Path to transportation parquet file with OSM road/rail data (as points)
     output_folder : str
         Path to output folder (will be created if it doesn't exist)
     """
@@ -115,67 +29,89 @@ def calculate_basin_transportation_from_pbf(basin_file, pbf_files, output_folder
 
     # Define output files
     output_csv = output_path / "transportation_statistics.csv"
-    output_shp_motorway = output_path / "transportation_motorway.shp"
-    output_shp_highway = output_path / "transportation_roads.shp"
-    output_shp_railway = output_path / "transportation_railway.shp"
+    output_gpkg_motorway = output_path / "transportation_motorway.gpkg"
+    output_gpkg_highway = output_path / "transportation_highways.gpkg"
+    output_gpkg_railway = output_path / "transportation_railway.gpkg"
 
-    # Read basins
+    # ===== READ BASINS =====
+    print("\nReading basin data...")
     basin_path = Path(basin_file)
-    print(f"\nReading basin data from {basin_path.suffix} file...")
+    if not basin_path.exists():
+        raise FileNotFoundError(f"Basin file not found: {basin_path}")
 
-    if basin_path.suffix == '.parquet':
-        # Read parquet file with fastparquet engine for better performance
-        df = pd.read_parquet(basin_file, engine='fastparquet')
-        # Convert WKB geometry column to shapely geometries
-        df['geometry'] = df['geometry'].apply(lambda x: wkblib.loads(x, hex=True) if isinstance(x, str) else wkblib.loads(x))
-        basins = gpd.GeoDataFrame(df, geometry='geometry', crs="EPSG:4326")
-    elif basin_path.suffix in ['.shp', '.geojson', '.gpkg']:
-        basins = gpd.read_file(basin_file)
-    else:
-        raise ValueError(f"Unsupported file format: {basin_path.suffix}")
+    try:
+        basins_df = pd.read_parquet(basin_file, engine='fastparquet')
+        print("  Using fastparquet engine")
+    except Exception as e:
+        print(f"  ⚠ fastparquet failed: {str(e)}")
+        print("  Falling back to pyarrow engine...")
+        basins_df = pd.read_parquet(basin_file, engine='pyarrow')
 
+    # Convert WKB geometry to shapely
+    print("  Converting geometries...")
+    if 'geometry' in basins_df.columns:
+        first_geom = basins_df['geometry'].iloc[0]
+        if isinstance(first_geom, (str, bytes)):
+            basins_df['geometry'] = basins_df['geometry'].apply(
+                lambda x: wkblib.loads(x, hex=True) if isinstance(x, str) else wkblib.loads(x)
+            )
+
+    basins = gpd.GeoDataFrame(basins_df, geometry='geometry', crs="EPSG:4326")
     print(f"Loaded {len(basins)} basins")
 
-    # Get bounding box of basins to speed up PBF processing
-    if basins.crs.to_epsg() != 4326:
-        basins_wgs84 = basins.to_crs("EPSG:4326")
-    else:
-        basins_wgs84 = basins
+    # ===== READ TRANSPORTATION PARQUET =====
+    print("\nReading transportation parquet...")
+    trans_path = Path(transportation_parquet)
+    if not trans_path.exists():
+        raise FileNotFoundError(f"Transportation parquet file not found: {trans_path}")
 
-    bbox = basins_wgs84.total_bounds  # [minx, miny, maxx, maxy]
-    print(f"Basin bounding box: {bbox}")
+    try:
+        trans_df = pd.read_parquet(transportation_parquet, engine='fastparquet')
+        print("  Using fastparquet engine")
+    except Exception as e:
+        print(f"  ⚠ fastparquet failed: {str(e)}")
+        print("  Falling back to pyarrow engine...")
+        trans_df = pd.read_parquet(transportation_parquet, engine='pyarrow')
 
-    # Find PBF files
-    if isinstance(pbf_files, str):
-        pbf_path = Path(pbf_files)
-        if pbf_path.is_dir():
-            files = list(pbf_path.glob("*.osm.pbf")) + list(pbf_path.glob("*.pbf"))
-        else:
-            files = [pbf_path]
-    else:
-        files = [Path(f) for f in pbf_files]
+    # Convert WKB geometry to shapely if needed
+    print("  Converting geometries...")
+    if 'geometry' in trans_df.columns:
+        first_geom = trans_df['geometry'].iloc[0]
+        if isinstance(first_geom, (str, bytes)):
+            trans_df['geometry'] = trans_df['geometry'].apply(
+                lambda x: wkblib.loads(x, hex=True) if isinstance(x, str) else wkblib.loads(x)
+            )
 
-    if not files:
-        raise FileNotFoundError("No PBF files found")
+    transportation = gpd.GeoDataFrame(trans_df, geometry='geometry', crs="EPSG:4326")
+    print(f"  Loaded {len(transportation):,} transportation features")
 
-    print(f"Found {len(files)} PBF file(s) to process")
+    # ===== VECTORIZED FILTERING =====
+    print("\nFiltering for roads and railways...")
 
-    # Extract transportation features from all PBF files
-    all_features = []
+    # Highway values we want
+    highway_values = [
+        'motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'residential',
+        'motorway_link', 'trunk_link', 'primary_link', 'secondary_link', 'tertiary_link',
+        'living_street', 'busway', 'footway', 'cycleway'
+    ]
 
-    for pbf_file in files:
-        print(f"\nExtracting transportation infrastructure from: {pbf_file.name}")
+    # Railway values we want
+    railway_values = ['light_rail', 'monorail', 'rail', 'subway', 'tram']
 
-        handler = TransportationExtractor(bbox=bbox)
-        handler.apply_file(str(pbf_file), locations=True)
+    # Filter
+    filter_criteria = pd.Series([False] * len(transportation), index=transportation.index)
 
-        print(f"\n  Found {len(handler.features):,} transportation segments in bounding box")
+    if 'highway' in transportation.columns:
+        filter_criteria |= transportation['highway'].isin(highway_values)
 
-        if handler.features:
-            all_features.extend(handler.features)
+    if 'railway' in transportation.columns:
+        filter_criteria |= transportation['railway'].isin(railway_values)
 
-    if not all_features:
-        print("\nWarning: No transportation features found in PBF files within basin area!")
+    transportation_filtered = transportation[filter_criteria].copy()
+    print(f"Filtered to {len(transportation_filtered):,} transportation features")
+
+    if len(transportation_filtered) == 0:
+        print("\nWarning: No transportation features found!")
         result = pd.DataFrame({
             'category': ['TOTAL'],
             'feature_type': ['All Transportation'],
@@ -184,140 +120,192 @@ def calculate_basin_transportation_from_pbf(basin_file, pbf_files, output_folder
         result.to_csv(output_csv, index=False)
         return result
 
-    # Convert to GeoDataFrame
-    print(f"\nConverting {len(all_features):,} transportation segments to GeoDataFrame...")
-    features = gpd.GeoDataFrame(all_features, crs="EPSG:4326")
-    print(f"Total transportation segments extracted: {len(features):,}")
+    # ===== RECONSTRUCT LINESTRINGS FROM POINTS =====
+    print("\nReconstructing LineStrings from point geometries...")
 
-    # Show what we found
+    # Group by way ID (osm_id or @id) to reconstruct line geometries
+    if '@id' in transportation_filtered.columns:
+        way_id_col = '@id'
+    elif 'osm_id' in transportation_filtered.columns:
+        way_id_col = 'osm_id'
+    else:
+        raise ValueError("No way ID column found (@id or osm_id)")
+
+    # Group by way ID and reconstruct geometries
+    reconstructed_ways = []
+
+    print(f"  Processing {transportation_filtered[way_id_col].nunique():,} unique ways...")
+
+    for way_id, group in transportation_filtered.groupby(way_id_col):
+        # Sort by node sequence if available
+        if '@sequence' in group.columns:
+            group = group.sort_values('@sequence')
+        elif 'node_sequence' in group.columns:
+            group = group.sort_values('node_sequence')
+
+        # Extract coordinates from Point geometries
+        coords = [(geom.x, geom.y) for geom in group.geometry]
+
+        # Need at least 2 points to make a line
+        if len(coords) >= 2:
+            # Determine infrastructure type and value
+            if 'highway' in group.columns and pd.notna(group['highway'].iloc[0]):
+                infra_type = 'highway'
+                feature_value = group['highway'].iloc[0]
+            elif 'railway' in group.columns and pd.notna(group['railway'].iloc[0]):
+                infra_type = 'railway'
+                feature_value = group['railway'].iloc[0]
+            else:
+                continue
+
+            # Create LineString
+            line = LineString(coords)
+
+            # Get metadata from first point in the way
+            reconstructed_ways.append({
+                'geometry': line,
+                'infrastructure_type': infra_type,
+                'feature_value': feature_value,
+                'osm_id': way_id,
+                'name': group['name'].iloc[0] if 'name' in group.columns else '',
+                'ref': group['ref'].iloc[0] if 'ref' in group.columns else ''
+            })
+
+    # Convert to GeoDataFrame
+    transportation_lines = gpd.GeoDataFrame(reconstructed_ways, crs="EPSG:4326")
+    print(f"  Reconstructed {len(transportation_lines):,} LineStrings")
+
+    # ===== SHOW BREAKDOWN =====
     print("\nBreakdown by infrastructure type:")
-    print(features['infrastructure_type'].value_counts())
+    print(transportation_lines['infrastructure_type'].value_counts())
 
     print("\nTop 20 feature types found:")
-    print(features['feature_value'].value_counts().head(20))
+    print(transportation_lines['feature_value'].value_counts().head(20))
 
-    # Reproject to match basins
-    if basins.crs != features.crs:
-        print(f"\nReprojecting features to match basins CRS: {basins.crs}...")
-        features = features.to_crs(basins.crs)
+    # ===== SPATIAL JOIN WITH BASINS =====
+    print("\nIntersecting transportation with basins...")
 
-    # If basins are in geographic coordinates, reproject to a meter-based CRS for accurate length
-    if basins.crs.is_geographic:
-        print("\nBasins are in geographic coordinates. Reprojecting to UTM for accurate length calculation...")
-        utm_crs = basins_wgs84.estimate_utm_crs()
+    # Ensure same CRS
+    if transportation_lines.crs != basins.crs:
+        transportation_lines = transportation_lines.to_crs(basins.crs)
 
-        features = features.to_crs(utm_crs)
-        basins_projected = basins.to_crs(utm_crs)
-    else:
-        basins_projected = basins
+    # Reproject to UTM for accurate length calculation
+    print("\nReprojecting to UTM for accurate length calculation...")
+    basins_wgs84 = basins.to_crs("EPSG:4326") if basins.crs.to_epsg() != 4326 else basins
+    utm_crs = basins_wgs84.estimate_utm_crs()
 
-    # Spatial intersection - clip features to basins
-    print("\nIntersecting transportation infrastructure with basins (clipping to basin boundaries)...")
-    features_in_basins = gpd.overlay(features, basins_projected, how='intersection')
+    transportation_utm = transportation_lines.to_crs(utm_crs)
+    basins_utm = basins.to_crs(utm_crs)
 
-    print(f"Transportation segments within basins: {len(features_in_basins):,}")
+    # Clip transportation to basin boundaries
+    print("Clipping transportation to basin boundaries...")
+    transportation_in_basins = gpd.overlay(transportation_utm, basins_utm, how='intersection')
 
-    if len(features_in_basins) == 0:
-        print("\nWarning: No transportation features found within basins!")
+    print(f"Transportation segments within basins: {len(transportation_in_basins):,}")
+
+    if len(transportation_in_basins) == 0:
+        print("\nWarning: No transportation found within basins!")
         result = pd.DataFrame({
             'category': ['TOTAL'],
             'feature_type': ['All Transportation'],
             'length_km': [0.0]
         })
+        total_length_km = 0
+        type_lengths = pd.DataFrame()
     else:
-        # Calculate length for each segment in meters
-        print("\nCalculating transportation infrastructure lengths...")
-        features_in_basins['length_m'] = features_in_basins.geometry.length
-        features_in_basins['length_km'] = features_in_basins['length_m'] / 1000
+        # ===== CALCULATE LENGTHS =====
+        print("\nCalculating lengths...")
+        transportation_in_basins['length_m'] = transportation_in_basins.geometry.length
+        transportation_in_basins['length_km'] = transportation_in_basins['length_m'] / 1000
 
-        # === EXPORT FILES ===
-        print(f"\nPreparing transportation features for export...")
+        # Reproject back to WGS84 for export
+        transportation_for_export = transportation_in_basins.to_crs("EPSG:4326")
 
-        # Reproject back to WGS84 for Shapefile
-        features_for_export = features_in_basins.to_crs("EPSG:4326")
+        # ===== EXPORT GEOPACKAGES =====
+        print("\nExporting GeoPackages...")
 
-        # Pre-calculate feature subsets in single pass
-        motorways = features_for_export[features_for_export['feature_value'] == 'motorway']
-        highways = features_for_export[
-            (features_for_export['infrastructure_type'] == 'highway') &
-            (features_for_export['feature_value'] != 'motorway')
+        # Separate by type
+        motorways = transportation_for_export[transportation_for_export['feature_value'] == 'motorway']
+        highways = transportation_for_export[
+            (transportation_for_export['infrastructure_type'] == 'highway') &
+            (transportation_for_export['feature_value'] != 'motorway')
         ]
-        railways = features_for_export[features_for_export['infrastructure_type'] == 'railway']
+        railways = transportation_for_export[transportation_for_export['infrastructure_type'] == 'railway']
 
-        # Save all shapefiles
+        # Export motorways
         if len(motorways) > 0:
-            print(f"Saving motorway features...")
-            motorways[['infrastructure_type', 'feature_value', 'name', 'ref', 'length_km', 'geometry']].rename(
-                columns={'infrastructure_type': 'infra_type', 'feature_value': 'feat_val'}
-            ).to_file(output_shp_motorway)
-            print(f"   ✓ {output_shp_motorway.name} - {len(motorways):,} features, {motorways['length_km'].sum():,.2f} km")
+            print(f"1. Saving motorways...")
+            motorways_export = motorways[['infrastructure_type', 'feature_value', 'name', 'ref', 'length_km', 'geometry']].copy()
+            motorways_export.to_file(output_gpkg_motorway, driver='GPKG', layer='motorways')
+            print(f"   ✓ {output_gpkg_motorway.name} - {len(motorways):,} features, {motorways['length_km'].sum():,.2f} km")
 
+        # Export highways
         if len(highways) > 0:
-            print(f"Saving highway features (non-motorway)...")
-            highways[['infrastructure_type', 'feature_value', 'name', 'ref', 'length_km', 'geometry']].rename(
-                columns={'infrastructure_type': 'infra_type', 'feature_value': 'feat_val'}
-            ).to_file(output_shp_highway)
-            print(f"   ✓ {output_shp_highway.name} - {len(highways):,} features, {highways['length_km'].sum():,.2f} km")
+            print(f"2. Saving highways...")
+            highways_export = highways[['infrastructure_type', 'feature_value', 'name', 'ref', 'length_km', 'geometry']].copy()
+            highways_export.to_file(output_gpkg_highway, driver='GPKG', layer='highways')
+            print(f"   ✓ {output_gpkg_highway.name} - {len(highways):,} features, {highways['length_km'].sum():,.2f} km")
 
+        # Export railways
         if len(railways) > 0:
-            print(f"Saving railway features...")
-            railways[['infrastructure_type', 'feature_value', 'name', 'ref', 'length_km', 'geometry']].rename(
-                columns={'infrastructure_type': 'infra_type', 'feature_value': 'feat_val'}
-            ).to_file(output_shp_railway)
-            print(f"   ✓ {output_shp_railway.name} - {len(railways):,} features, {railways['length_km'].sum():,.2f} km")
+            print(f"3. Saving railways...")
+            railways_export = railways[['infrastructure_type', 'feature_value', 'name', 'ref', 'length_km', 'geometry']].copy()
+            railways_export.to_file(output_gpkg_railway, driver='GPKG', layer='railways')
+            print(f"   ✓ {output_gpkg_railway.name} - {len(railways):,} features, {railways['length_km'].sum():,.2f} km")
 
-        # === CALCULATE STATISTICS ===
-        # Calculate total length
-        total_length_km = features_in_basins['length_km'].sum()
+        # ===== CALCULATE STATISTICS =====
+        total_length_km = transportation_in_basins['length_km'].sum()
 
-        # Calculate length by feature type
-        type_lengths = features_in_basins.groupby('feature_value')['length_km'].sum().reset_index()
+        # Length by feature type
+        type_lengths = transportation_in_basins.groupby('feature_value')['length_km'].sum().reset_index()
         type_lengths.columns = ['feature_type', 'length_km']
         type_lengths = type_lengths.sort_values('feature_type').reset_index(drop=True)
-
-        # Add category column for detailed rows
         type_lengths['category'] = 'DETAIL'
 
-        # Create summary row
+        # Summary row
         summary_row = pd.DataFrame({
             'category': ['TOTAL'],
             'feature_type': ['All Transportation'],
             'length_km': [total_length_km]
         })
 
-        # Combine: summary first, then details
-        result = pd.concat([summary_row, type_lengths[['category', 'feature_type', 'length_km']]],
-                           ignore_index=True)
+        # Combine
+        result = pd.concat(
+            [summary_row, type_lengths[['category', 'feature_type', 'length_km']]],
+            ignore_index=True
+        )
 
+        # Print breakdown
         print("\n" + "=" * 60)
-        print("Transportation infrastructure length breakdown (top 20):")
+        print("Transportation length breakdown (top 20):")
         print("=" * 60)
         for _, row in type_lengths.head(20).iterrows():
             print(f"  {row['feature_type']}: {row['length_km']:,.2f} km")
 
-        # Summary by infrastructure type (highway vs railway)
-        infra_summary = features_in_basins.groupby('infrastructure_type')['length_km'].sum()
+        # Summary by type
+        infra_summary = transportation_in_basins.groupby('infrastructure_type')['length_km'].sum()
         print("\nSummary by infrastructure type:")
         for infra_type, length in infra_summary.items():
             print(f"  {infra_type}: {length:,.2f} km")
 
-    # Save statistics to CSV
-    print(f"\n5. Saving statistics CSV...")
+    # ===== SAVE CSV =====
+    print(f"\n4. Saving statistics CSV...")
     result.to_csv(output_csv, index=False)
     print(f"   ✓ {output_csv.name}")
 
-    # Print final summary
+    # ===== FINAL SUMMARY =====
     print("\n" + "=" * 60)
     print("TRANSPORTATION INFRASTRUCTURE STATISTICS")
     print("=" * 60)
     print(f"Total infrastructure length: {total_length_km:,.2f} km")
-    print(f"Segments analyzed: {len(features_in_basins):,}")
-    print(f"Unique feature types: {len(type_lengths)}")
-    print("\nFiles created in: {output_path}")
-    print("  1. transportation_motorway.shp (motorways only)")
-    print("  2. transportation_roads.shp (other highways)")
-    print("  3. transportation_railway.shp (railways only)")
-    print("  4. transportation_statistics.csv (length statistics)")
+    if len(type_lengths) > 0:
+        print(f"Segments analyzed: {len(transportation_in_basins):,}")
+        print(f"Unique feature types: {len(type_lengths)}")
+    print(f"\nFiles created in: {output_path}")
+    print("  1. transportation_motorway.gpkg (motorways)")
+    print("  2. transportation_highways.gpkg (other highways)")
+    print("  3. transportation_railway.gpkg (railways)")
+    print("  4. transportation_statistics.csv")
     print("=" * 60)
 
     return result
@@ -326,16 +314,15 @@ def calculate_basin_transportation_from_pbf(basin_file, pbf_files, output_folder
 # Usage
 if __name__ == "__main__":
     basin_file = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\catchments_718.parquet"
-    pbf_files = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\OSM\central-america-260204.osm.pbf"
+    transportation_parquet = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\OSM_Parquet\central-america.parquet"
 
-    # Output folder (will be created if it doesn't exist)
     output_folder = r"C:\C_Drive_Brians_Stuff\Python_Projects\Transportation_Impact"
 
-    results = calculate_basin_transportation_from_pbf(
+    results = calculate_basin_transportation_from_parquet(
         basin_file,
-        pbf_files,
+        transportation_parquet,
         output_folder
     )
 
-    print("\n\nStatistics table (first 20 rows):")
+    print("\n\nStatistics table:")
     print(results.head(20))
