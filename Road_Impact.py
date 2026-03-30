@@ -2,95 +2,27 @@ import geopandas as gpd
 import pandas as pd
 from pathlib import Path
 import shapely.wkb as wkblib
-from shapely.geometry import LineString, MultiLineString
-import numpy as np
+import dask_geopandas as dgpd
 
-#@profile
-def calculate_basin_transportation_from_parquet(basin_file, transportation_parquet, output_folder):
-    """
-    Calculate transportation infrastructure statistics from transportation parquet file.
-    Processes LineString features only and calculates lengths.
-    Uses vectorized operations for fast processing.
-    FULLY OPTIMIZED - NO LOOPS.
 
-    Parameters:
-    -----------
-    basin_file : str
-        Path to basin parquet file
-    transportation_parquet : str
-        Path to transportation parquet file with OSM line data (roads/railways)
-    output_folder : str
-        Path to output folder (will be created if it doesn't exist)
-    """
+# @profile
+def calculate_basin_transportation(basin_file,rivers, transportation_parquet, output_folder,index):
 
     # Create output folder
     output_path = Path(output_folder)
     output_path.mkdir(parents=True, exist_ok=True)
-    print(f"Output folder: {output_path}")
 
     # Define output files
-    output_csv = output_path / "transportation_statistics.csv"
-    output_gpkg = output_path / "transportation_affected.gpkg"
+    output_csv = output_path / f"transportation_statistics{index}.csv"
+    output_gpkg = output_path / f"transportation_affected{index}.gpkg"
 
     # ===== READ BASINS =====
-    print("\nReading basin data...")
-    basin_path = Path(basin_file)
-    if not basin_path.exists():
-        raise FileNotFoundError(f"Basin file not found: {basin_path}")
-
-    try:
-        basins_df = pd.read_parquet(basin_file, engine='fastparquet')
-        print("  Using fastparquet engine")
-    except Exception as e:
-        print(f"  ⚠ fastparquet failed: {str(e)}")
-        print("  Falling back to pyarrow engine...")
-        basins_df = pd.read_parquet(basin_file, engine='pyarrow')
-
-    # Convert WKB geometry to shapely
-    print("  Converting geometries...")
-    if 'geometry' in basins_df.columns:
-        first_geom = basins_df['geometry'].iloc[0]
-        if isinstance(first_geom, (str, bytes)):
-            basins_df['geometry'] = basins_df['geometry'].apply(
-                lambda x: wkblib.loads(x, hex=True) if isinstance(x, str) else wkblib.loads(x)
-            )
-
-    basins = gpd.GeoDataFrame(basins_df, geometry='geometry', crs="EPSG:4326")
-    print(f"Loaded {len(basins)} basins")
+    basins = gpd.read_parquet(basin_file, filters=[('linkno', 'in', rivers)])
 
     # ===== READ TRANSPORTATION PARQUET =====
-    print("\nReading transportation parquet...")
-    trans_path = Path(transportation_parquet)
-    if not trans_path.exists():
-        raise FileNotFoundError(f"Transportation parquet file not found: {trans_path}")
-
-    try:
-        trans_df = pd.read_parquet(transportation_parquet, engine='fastparquet')
-        print("  Using fastparquet engine")
-    except Exception as e:
-        print(f"  ⚠ fastparquet failed: {str(e)}")
-        print("  Falling back to pyarrow engine...")
-        trans_df = pd.read_parquet(transportation_parquet, engine='pyarrow')
-
-    # Convert WKB geometry to shapely if needed
-    print("  Converting geometries...")
-    if 'geometry' in trans_df.columns:
-        first_geom = trans_df['geometry'].iloc[0]
-        if isinstance(first_geom, (str, bytes)):
-            trans_df['geometry'] = trans_df['geometry'].apply(
-                lambda x: wkblib.loads(x, hex=True) if isinstance(x, str) else wkblib.loads(x)
-            )
-
-    transportation = gpd.GeoDataFrame(trans_df, geometry='geometry', crs="EPSG:4326")
-    print(f"  Loaded {len(transportation):,} transportation features")
-
-    # Verify geometry types
-    geom_types = transportation.geometry.type.value_counts()
-    print(f"  Geometry types: {geom_types.to_dict()}")
+    transportation = gpd.read_parquet(transportation_parquet)
 
     # ===== VECTORIZED FILTERING =====
-    print("\nFiltering for roads and railways...")
-
     # Highway values we want
     highway_values = [
         'motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'residential',
@@ -98,7 +30,7 @@ def calculate_basin_transportation_from_parquet(basin_file, transportation_parqu
         'living_street', 'busway', 'footway', 'cycleway'
     ]
 
-    # Railway values we want
+    # Railway values we want+
     railway_values = ['light_rail', 'monorail', 'rail', 'subway', 'tram']
 
     # Combine criteria - check if highway OR railway column has matching values
@@ -107,18 +39,14 @@ def calculate_basin_transportation_from_parquet(basin_file, transportation_parqu
     if 'highway' in transportation.columns:
         highway_mask = transportation['highway'].isin(highway_values)
         filter_criteria |= highway_mask
-        print(f"  Highway features: {highway_mask.sum():,}")
 
     if 'railway' in transportation.columns:
         railway_mask = transportation['railway'].isin(railway_values)
         filter_criteria |= railway_mask
-        print(f"  Railway features: {railway_mask.sum():,}")
 
     transportation_filtered = transportation[filter_criteria].copy()
-    print(f"\nFiltered to {len(transportation_filtered):,} transportation features")
 
     if len(transportation_filtered) == 0:
-        print("\nWarning: No transportation features found!")
         result = pd.DataFrame({
             'category': ['TOTAL'],
             'feature_type': ['All Transportation'],
@@ -128,8 +56,6 @@ def calculate_basin_transportation_from_parquet(basin_file, transportation_parqu
         return result
 
     # ===== ASSIGN INFRASTRUCTURE TYPE =====
-    print("\nAssigning infrastructure types...")
-
     def assign_type(row):
         if 'highway' in row and pd.notna(row.get('highway')) and row['highway'] in highway_values:
             return 'highway', row['highway']
@@ -145,25 +71,25 @@ def calculate_basin_transportation_from_parquet(basin_file, transportation_parqu
     transportation_filtered = transportation_filtered[transportation_filtered['infrastructure_type'].notna()].copy()
 
     # ===== SPATIAL JOIN WITH BASINS =====
-    print("\nIntersecting transportation with basins...")
 
     # Ensure same CRS
     if transportation_filtered.crs != basins.crs:
         transportation_filtered = transportation_filtered.to_crs(basins.crs)
 
-    # Reproject to UTM for accurate length calculation
-    print("Reprojecting to UTM for accurate length calculation...")
-    basins_wgs84 = basins.to_crs("EPSG:4326") if basins.crs.to_epsg() != 4326 else basins
-    utm_crs = basins_wgs84.estimate_utm_crs()
+    # ===== EQUAL AREA PROJECTION FOR ACCURATE GLOBAL LENGTH CALCULATION =====
+    cea_crs = "ESRI:54034"
 
-    transportation_utm = transportation_filtered.to_crs(utm_crs)
-    basins_utm = basins.to_crs(utm_crs)
+    # Reproject to equal-area projection
+    transportation_projected = transportation_filtered.to_crs(cea_crs)
+    basins_projected = basins.to_crs({'proj': 'cea'})
+
 
     # Clip transportation to basin boundaries
-    print("Clipping transportation to basin boundaries...")
-    transportation_in_basins = gpd.overlay(transportation_utm, basins_utm, how='intersection')
-
-    print(f"Transportation segments within basins: {len(transportation_in_basins):,}")
+    transportation_in_basins = gpd.overlay(
+        dgpd.from_geopandas(transportation_projected, npartitions=8),
+        dgpd.from_geopandas(basins_projected, npartitions=8),
+        how='intersection'
+    ).compute()
 
     if len(transportation_in_basins) == 0:
         print("\nWarning: No transportation found within basins!")
@@ -175,8 +101,7 @@ def calculate_basin_transportation_from_parquet(basin_file, transportation_parqu
         total_length_km = 0
         type_lengths = pd.DataFrame()
     else:
-        # ===== CALCULATE LENGTHS =====
-        print("\nCalculating lengths...")
+        # ===== CALCULATE LENGTHS (IN EQUAL AREA PROJECTION FOR ACCURACY) =====
         transportation_in_basins['length_m'] = transportation_in_basins.geometry.length
         transportation_in_basins['length_km'] = transportation_in_basins['length_m'] / 1000
 
@@ -184,14 +109,12 @@ def calculate_basin_transportation_from_parquet(basin_file, transportation_parqu
         transportation_for_export = transportation_in_basins.to_crs("EPSG:4326")
 
         # ===== EXPORT TO SINGLE GEOPACKAGE WITH MULTIPLE LAYERS (AS LINES) =====
-        print("\nExporting to GeoPackage with multiple layers...")
-
         # Separate by type
         motorways = transportation_for_export[transportation_for_export['feature_value'] == 'motorway']
         highways = transportation_for_export[
             (transportation_for_export['infrastructure_type'] == 'highway') &
             (transportation_for_export['feature_value'] != 'motorway')
-        ]
+            ]
         railways = transportation_for_export[transportation_for_export['infrastructure_type'] == 'railway']
 
         # Select columns for export
@@ -201,26 +124,18 @@ def calculate_basin_transportation_from_parquet(basin_file, transportation_parqu
 
         # Export motorways layer (as lines, not points)
         if len(motorways) > 0:
-            print(f"1. Saving motorways layer (LineStrings)...")
             motorways_export = motorways[[col for col in export_cols if col in motorways.columns]].copy()
             motorways_export.to_file(output_gpkg, driver='GPKG', layer='motorways')
-            print(f"   ✓ Layer: motorways - {len(motorways):,} features, {motorways['length_km'].sum():,.2f} km")
 
         # Export highways layer (as lines, not points)
         if len(highways) > 0:
-            print(f"2. Saving highways layer (LineStrings)...")
             highways_export = highways[[col for col in export_cols if col in highways.columns]].copy()
             highways_export.to_file(output_gpkg, driver='GPKG', layer='highways')
-            print(f"   ✓ Layer: highways - {len(highways):,} features, {highways['length_km'].sum():,.2f} km")
 
         # Export railways layer (as lines, not points)
         if len(railways) > 0:
-            print(f"3. Saving railways layer (LineStrings)...")
             railways_export = railways[[col for col in export_cols if col in railways.columns]].copy()
             railways_export.to_file(output_gpkg, driver='GPKG', layer='railways')
-            print(f"   ✓ Layer: railways - {len(railways):,} features, {railways['length_km'].sum():,.2f} km")
-
-        print(f"\n✓ All layers saved to: {output_gpkg.name}")
 
         # ===== CALCULATE STATISTICS =====
         total_length_km = transportation_in_basins['length_km'].sum()
@@ -244,40 +159,8 @@ def calculate_basin_transportation_from_parquet(basin_file, transportation_parqu
             ignore_index=True
         )
 
-        # Print breakdown
-        print("\n" + "=" * 60)
-        print("Transportation length breakdown (top 20):")
-        print("=" * 60)
-        for _, row in type_lengths.head(20).iterrows():
-            print(f"  {row['feature_type']}: {row['length_km']:,.2f} km")
-
-        # Summary by infrastructure type
-        infra_summary = transportation_in_basins.groupby('infrastructure_type')['length_km'].sum()
-        print("\nSummary by infrastructure type:")
-        for infra_type, length in infra_summary.items():
-            print(f"  {infra_type}: {length:,.2f} km")
-
     # ===== SAVE CSV =====
-    print(f"\n4. Saving statistics CSV...")
     result.to_csv(output_csv, index=False)
-    print(f"   ✓ {output_csv.name}")
-
-    # ===== FINAL SUMMARY =====
-    print("\n" + "=" * 60)
-    print("TRANSPORTATION INFRASTRUCTURE STATISTICS")
-    print("=" * 60)
-    print(f"Total infrastructure length: {total_length_km:,.2f} km")
-    if len(type_lengths) > 0:
-        print(f"Segments analyzed: {len(transportation_in_basins):,}")
-        print(f"Unique feature types: {len(type_lengths)}")
-    print(f"\nFiles created in: {output_path}")
-    print("  1. transportation_affected.gpkg (LineStrings)")
-    print("     - motorways (layer)")
-    print("     - highways (layer)")
-    print("     - railways (layer)")
-    print("  2. transportation_statistics.csv")
-    print("=" * 60)
-
     return result
 
 
@@ -288,11 +171,8 @@ if __name__ == "__main__":
 
     output_folder = r"C:\C_Drive_Brians_Stuff\Python_Projects\Transportation_Impact"
 
-    results = calculate_basin_transportation_from_parquet(
+    results = calculate_basin_transportation(
         basin_file,
         transportation_parquet,
         output_folder
     )
-
-    print("\n\nStatistics table:")
-    print(results.head(20))
