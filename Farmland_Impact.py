@@ -1,117 +1,51 @@
-from operator import index
-
 import geopandas as gpd
-import rasterio
-from rasterio.mask import mask
-import numpy as np
 import pandas as pd
-from pathlib import Path
-from shapely.geometry import box
-from rasterio.io import MemoryFile
-from rasterio.merge import merge
-from rasterio.features import rasterize
-import warnings
-warnings.filterwarnings('ignore')
+
+_FARM_GDF: gpd.GeoDataFrame = None
+def get_farmland_gdf(farmland_parquet):
+    # This means each process only reads the farm parquet once
+    global _FARM_GDF
+    if _FARM_GDF is None:
+        _FARM_GDF = gpd.read_parquet(farmland_parquet)
+    return _FARM_GDF
 
 # @profile
-def calculate_basin_farmland(basin_file, rivers, farmland_raster_folder, output_folder, index, farmland_value=40):
-
-    # Create output folder
-    output_path = Path(output_folder)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # Define output files
-    output_csv = output_path / f"farmland_statistics_{index}.csv"
-    
-
+def calculate_basin_farmland(basin_file, rivers, farmland_parquet):
     # ===== READ BASINS =====
     # Get first raster's CRS and reproject basins once
-    basins = gpd.read_parquet(basin_file, filters=[('linkno', 'in', rivers)]).to_crs(4326)
+    basins = gpd.read_parquet(basin_file, filters=[('linkno', 'in', rivers)]).to_crs({'proj': 'cea'})
 
-    # Find all .tif files in the folder
-    raster_folder = Path(farmland_raster_folder)
-    raster_files = list(raster_folder.glob("*.tif"))
-
-    if not raster_files:
-        raise FileNotFoundError(f"No .tif files found in {raster_folder}")
-
-    # Initialize counters
-    total_farmland_cells = 0
+    # Get farmland GeoDataFrame (cached in memory after first read)
+    farm_gdf = get_farmland_gdf(farmland_parquet)
     
-    # spatial index
-    sindex = basins.sindex
+    # Filter farmland to only the basins of interest (spatial index is used automatically by geopandas and is fast)
+    farm_gdf = (
+        gpd.sjoin(farm_gdf, basins[['geometry']], how='inner', predicate='intersects')
+        .drop(columns=['index_right'])
+        .to_crs({'proj': 'cea'}) # This projection is correctly in meters, so area calculations will be accurate
+    )
+    
+    # Find the area of farmland intersecting each basin
+    intersections = gpd.overlay(basins, farm_gdf, how="intersection")
+    intersections["area_m2"] = intersections.geometry.area
+    result = (
+        intersections
+        .groupby("linkno")["area_m2"]
+        .sum()
+        .reset_index()
+    )
+    
+    # Add dropped linknos with 0 area
+    missing_linknos = set(rivers) - set(result['linkno'])
+    if missing_linknos:
+        result = pd.concat([result, pd.DataFrame({'linkno': list(missing_linknos), 'area_m2': 0})], ignore_index=True)
+    
+    result['area_km2'] = result['area_m2'] / 1e6
 
-    # Process each raster tile
-    num_tiles_rasterized = 0
-    for raster_file in raster_files:
-        with rasterio.open(raster_file) as src:
-            # Quick check: does this tile intersect with ANY basin?
-            raster_bounds_geom = box(*src.bounds)
+    return result[['linkno', 'area_km2']]
 
-            # Find intersecting basins (spatial index is used automatically by geopandas)
-            candidates = basins.iloc[list(sindex.intersection(raster_bounds_geom.bounds))]
-            intersecting_basins: gpd.GeoDataFrame = candidates[candidates.intersects(raster_bounds_geom)]
-            
-            if intersecting_basins.empty:
-                continue  # Skip this tile if it doesn't intersect any basin
-            
-            # mask_arr = rasterize(
-            #     [(geom, 1) for geom in intersecting_basins.geometry],
-            #     out_shape=(src.height, src.width),
-            #     transform=src.transform,
-            #     fill=0,
-            #     dtype="uint8"
-            # )
-            farmland_mask, transform = mask(src, intersecting_basins.geometry, crop=True, all_touched=True, nodata=0)
-            
-
-            # # Read raster (still full read — see next improvement)
-            # data = src.read(1)
-
-            farmland_cells = np.count_nonzero(farmland_mask)
-
-            if farmland_cells == 0:
-                continue
-            
-            total_farmland_cells += farmland_cells
-            output_raster = output_path / f"farmland_affected_{index}_{num_tiles_rasterized}.tif"
-            num_tiles_rasterized += 1
-            
-            shape = farmland_mask.shape
-            transform = src.transform
-            
-            with rasterio.open(
-                    output_raster,
-                    "w",
-                    driver="GTiff",
-                    height=shape[0],
-                    width=shape[1],
-                    count=1,
-                    dtype=rasterio.uint8,
-                    crs=src.crs,
-                    transform=transform,
-                    nodata=0,
-                    compress='deflate'
-            ) as dst:
-                dst.write(farmland_mask.astype(np.uint8), 1)
-
-    if num_tiles_rasterized == 0:
-        raise FileNotFoundError(f"No valid tile files found in {raster_folder}")
-
-
-    # Calculate area
-    pixel_area_km2 = (10 * 10) / 1_000_000  # 0.0001 km² per pixel
-    total_farmland_area_km2 = total_farmland_cells * pixel_area_km2
-
-    # === CREATE STATISTICS CSV ===
-
-    result = pd.DataFrame({
-        'total_farmland_area_km2': [total_farmland_area_km2]
-    })
-
-    result.to_csv(output_csv, index=False)
-    return result
-
+def calculate_basin_farmland_wrapper(args):
+    return calculate_basin_farmland(*args)
 
 # Usage
 if __name__ == "__main__":

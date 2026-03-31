@@ -8,13 +8,14 @@ import warnings
 import rasterio
 import multiprocessing as mp
 import numpy as np
-from scipy.spatial import cKDTree
+from sklearn.cluster import KMeans
+import tqdm
 
 warnings.filterwarnings('ignore')
 
 # Import your four impact models
 from Population_Impact import calculate_basin_population
-from Farmland_Impact import calculate_basin_farmland
+from Farmland_Impact import calculate_basin_farmland, calculate_basin_farmland_wrapper
 from Building_Impact import calculate_basin_buildings
 from Road_Impact import calculate_basin_transportation
 
@@ -56,29 +57,17 @@ class ImpactAnalysisWorkflow:
         self.start_time = None
         self.end_time = None
         
-    def get_sorted_basins(self):
+    def get_sorted_rivids(self):
+        # By sorting, this helps computation because we get basins that are close to each other
         gdf = gpd.read_parquet(self.basin_file)
         centroid = gdf.geometry.centroid
-        coords = np.column_stack([centroid.x, centroid.y])
-        tree = cKDTree(coords)
+        distance_from_0_0 = np.sqrt(centroid.x**2 + centroid.y**2)
+        gdf['distance_from_0_0'] = distance_from_0_0
+        gdf = gdf.sort_values('distance_from_0_0')
+        # gdf.to_parquet(self.master_output / "sorted_basins.parquet") # optional, for debugging
+        return gdf['linkno'].tolist()
 
-        visited = set()
-        order = []
-        current = 0
-
-        for _ in range(len(coords)):
-            order.append(current)
-            visited.add(current)
-
-            dists, idxs = tree.query(coords[current], k=len(coords))
-            for i in idxs:
-                if i not in visited:
-                    current = i
-                    break
-
-        gdf = gdf.iloc[order]
-        return gdf
-
+    # @profile
     def run_all_analyses(self):
         """Run all four impact analyses in parallel."""
 
@@ -103,19 +92,20 @@ class ImpactAnalysisWorkflow:
 
         # Run analyses in parallel
         # Sort so that basins are processed in a consistent order (top to bottom, left to right)
-        gdf = self.get_sorted_basins()
-        rivers = gdf['linkno'].tolist()
-        n = 1000
+        n = 50 # Sweet spot?
+        rivers = self.get_sorted_rivids() # 6:32 kmeans, 5:55 hilbert, 4:44 distance from 0,0
         rivers_split = [rivers[i:i+n] for i in range(0, len(rivers), n)]
-      # with mp.Pool(processes=self.max_workers) as pool:
+        with mp.Pool(processes=self.max_workers) as pool:
       #     temp_output = str(self.master_output / "_temp_population")
       #     args = [(basin_file, rivs, self.config['population_raster'], temp_output, index) for index, rivs in enumerate(rivers_split)]
       #     pool.starmap(calculate_basin_population, args)
-      #   with mp.Pool(processes=self.max_workers) as pool:
-        temp_output = str(self.master_output / "_temp_farmland")
-        # args = [(basin_file, rivs, self.config['farmland_raster_folder'], temp_output, index) for index, rivs in enumerate(rivers_split)]
-        calculate_basin_farmland(basin_file, rivers_split[0], self.config['farmland_raster_folder'], temp_output, 0)
-      #       pool.starmap(calculate_basin_farmland, args)
+
+            # 16 cores == 29 GB peak memory
+            args = [(basin_file, rivs, self.config['farmland_parquet']) for rivs in rivers_split]
+            farmland_dfs = list(tqdm.tqdm(pool.imap_unordered(calculate_basin_farmland_wrapper, args), total=len(args)))
+            pd.concat(farmland_dfs, ignore_index=True).to_csv(self.consolidated_stats / "farmland_statistics.csv", index=False)
+            
+            
       # with mp.Pool(processes=self.max_workers) as pool:
       #     temp_output = str(self.master_output / "_temp_buildings")
       #     args = [(basin_file, rivs, self.config['building_parquet'], temp_output, index) for index, rivs in enumerate(rivers_split)]
@@ -486,6 +476,7 @@ if __name__ == "__main__":
     config = {
         'population_raster': r"C:\Users\ricky\Downloads\Flood_Impact_Model-selected\Population\global_pop_2025_CN_1km_R2025A_UA_v1.tif",
         'farmland_raster_folder': r"C:\Users\ricky\Downloads\ESA_Caribbean\ESA_Caribbean",
+        'farmland_parquet': r"C:\Users\ricky\Downloads\cropland.parquet",
         'building_parquet': osm,
         'transportation_parquet': osm,
     }
@@ -497,7 +488,7 @@ if __name__ == "__main__":
         basin_file,
         config,
         master_output_folder,
-        max_workers=4  # Adjust based on your system (4 is good for 32GB+ RAM)
+        max_workers=mp.cpu_count()  # Adjust based on your system (4 is good for 32GB+ RAM)
     )
     workflow.run_all_analyses()
 
