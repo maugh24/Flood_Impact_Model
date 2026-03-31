@@ -7,6 +7,8 @@ from datetime import datetime
 import warnings
 import rasterio
 import multiprocessing as mp
+import numpy as np
+from scipy.spatial import cKDTree
 
 warnings.filterwarnings('ignore')
 
@@ -53,6 +55,29 @@ class ImpactAnalysisWorkflow:
         self.results = {}
         self.start_time = None
         self.end_time = None
+        
+    def get_sorted_basins(self):
+        gdf = gpd.read_parquet(self.basin_file)
+        centroid = gdf.geometry.centroid
+        coords = np.column_stack([centroid.x, centroid.y])
+        tree = cKDTree(coords)
+
+        visited = set()
+        order = []
+        current = 0
+
+        for _ in range(len(coords)):
+            order.append(current)
+            visited.add(current)
+
+            dists, idxs = tree.query(coords[current], k=len(coords))
+            for i in idxs:
+                if i not in visited:
+                    current = i
+                    break
+
+        gdf = gdf.iloc[order]
+        return gdf
 
     def run_all_analyses(self):
         """Run all four impact analyses in parallel."""
@@ -77,8 +102,9 @@ class ImpactAnalysisWorkflow:
         # }
 
         # Run analyses in parallel
-        # print(f"\nStarting {len(analyses)} analyses in parallel...")
-        rivers = pd.read_parquet(basin_file, columns=['linkno']).values[:, 0]
+        # Sort so that basins are processed in a consistent order (top to bottom, left to right)
+        gdf = self.get_sorted_basins()
+        rivers = gdf['linkno'].tolist()
         n = 1000
         rivers_split = [rivers[i:i+n] for i in range(0, len(rivers), n)]
       # with mp.Pool(processes=self.max_workers) as pool:
@@ -87,7 +113,7 @@ class ImpactAnalysisWorkflow:
       #     pool.starmap(calculate_basin_population, args)
       #   with mp.Pool(processes=self.max_workers) as pool:
         temp_output = str(self.master_output / "_temp_farmland")
-        args = [(basin_file, rivs, self.config['farmland_raster_folder'], temp_output, index) for index, rivs in enumerate(rivers_split)]
+        # args = [(basin_file, rivs, self.config['farmland_raster_folder'], temp_output, index) for index, rivs in enumerate(rivers_split)]
         calculate_basin_farmland(basin_file, rivers_split[0], self.config['farmland_raster_folder'], temp_output, 0)
       #       pool.starmap(calculate_basin_farmland, args)
       # with mp.Pool(processes=self.max_workers) as pool:
@@ -455,16 +481,16 @@ def run_worfklow(basin_file, config, master_output_folder):
 # ===== USAGE =====
 if __name__ == "__main__":
     # Configuration
-    basin_file = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\catchments_718.parquet"
-
+    basin_file = r"C:\Users\ricky\Downloads\catchments_718.parquet"
+    osm = r"C:\Users\ricky\Downloads\Flood_Impact_Model-selected\OSM_Parquet\central-america.parquet"
     config = {
-        'population_raster': r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\global_pop_2025_CN_1km_R2025A_UA_v1.tif",
-        'farmland_raster_folder': r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\ESA_Caribbean",
-        'building_parquet': r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\OSM_Parquet\central-america-QGIS-polygons.parquet",
-        'transportation_parquet': r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\OSM_Parquet\central-america-QGIS-lines.parquet"
+        'population_raster': r"C:\Users\ricky\Downloads\Flood_Impact_Model-selected\Population\global_pop_2025_CN_1km_R2025A_UA_v1.tif",
+        'farmland_raster_folder': r"C:\Users\ricky\Downloads\ESA_Caribbean\ESA_Caribbean",
+        'building_parquet': osm,
+        'transportation_parquet': osm,
     }
 
-    master_output_folder = r"C:\C_Drive_Brians_Stuff\Python_Projects\Global_Impact_Analysis"
+    master_output_folder = r"C:\Users\ricky\Downloads\brian_test"
 
     # Run workflow with parallel execution (adjust max_workers based on your RAM)
     workflow = ImpactAnalysisWorkflow(

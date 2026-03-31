@@ -1,8 +1,6 @@
 import geopandas as gpd
 import pandas as pd
 from pathlib import Path
-import shapely.wkb as wkblib
-import dask_geopandas as dgpd
 
 
 # @profile
@@ -86,10 +84,10 @@ def calculate_basin_transportation(basin_file,rivers, transportation_parquet, ou
 
     # Clip transportation to basin boundaries
     transportation_in_basins = gpd.overlay(
-        dgpd.from_geopandas(transportation_projected, npartitions=8),
-        dgpd.from_geopandas(basins_projected, npartitions=8),
+        transportation_projected,
+        basins_projected,
         how='intersection'
-    ).compute()
+    )
 
     if len(transportation_in_basins) == 0:
         print("\nWarning: No transportation found within basins!")
