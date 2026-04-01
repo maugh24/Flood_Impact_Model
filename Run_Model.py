@@ -7,12 +7,15 @@ from datetime import datetime
 import warnings
 import rasterio
 import multiprocessing as mp
+import numpy as np
+from sklearn.cluster import KMeans
+import tqdm
 
 warnings.filterwarnings('ignore')
 
 # Import your four impact models
 from Population_Impact import calculate_basin_population
-from Farmland_Impact import calculate_basin_farmland
+from Farmland_Impact import calculate_basin_farmland, calculate_basin_farmland_wrapper
 from Building_Impact import calculate_basin_buildings
 from Road_Impact import calculate_basin_transportation
 
@@ -53,7 +56,18 @@ class ImpactAnalysisWorkflow:
         self.results = {}
         self.start_time = None
         self.end_time = None
+        
+    def get_sorted_rivids(self):
+        # By sorting, this helps computation because we get basins that are close to each other
+        gdf = gpd.read_parquet(self.basin_file)
+        centroid = gdf.geometry.centroid
+        distance_from_0_0 = np.sqrt(centroid.x**2 + centroid.y**2)
+        gdf['distance_from_0_0'] = distance_from_0_0
+        gdf = gdf.sort_values('distance_from_0_0')
+        # gdf.to_parquet(self.master_output / "sorted_basins.parquet") # optional, for debugging
+        return gdf['linkno'].tolist()
 
+    # @profile
     def run_all_analyses(self):
         """Run all four impact analyses in parallel."""
 
@@ -77,19 +91,21 @@ class ImpactAnalysisWorkflow:
         # }
 
         # Run analyses in parallel
-        # print(f"\nStarting {len(analyses)} analyses in parallel...")
-        rivers = pd.read_parquet(basin_file, columns=['linkno']).values[:, 0]
-        n = 1000
+        # Sort so that basins are processed in a consistent order (top to bottom, left to right)
+        n = 50 # Sweet spot?
+        rivers = self.get_sorted_rivids() # 6:32 kmeans, 5:55 hilbert, 4:44 distance from 0,0
         rivers_split = [rivers[i:i+n] for i in range(0, len(rivers), n)]
-      # with mp.Pool(processes=self.max_workers) as pool:
+        with mp.Pool(processes=self.max_workers) as pool:
       #     temp_output = str(self.master_output / "_temp_population")
       #     args = [(basin_file, rivs, self.config['population_raster'], temp_output, index) for index, rivs in enumerate(rivers_split)]
       #     pool.starmap(calculate_basin_population, args)
-      #   with mp.Pool(processes=self.max_workers) as pool:
-        temp_output = str(self.master_output / "_temp_farmland")
-        args = [(basin_file, rivs, self.config['farmland_raster_folder'], temp_output, index) for index, rivs in enumerate(rivers_split)]
-        calculate_basin_farmland(basin_file, rivers_split[0], self.config['farmland_raster_folder'], temp_output, 0)
-      #       pool.starmap(calculate_basin_farmland, args)
+
+            # 16 cores == 29 GB peak memory
+            args = [(basin_file, rivs, self.config['farmland_parquet']) for rivs in rivers_split]
+            farmland_dfs = list(tqdm.tqdm(pool.imap_unordered(calculate_basin_farmland_wrapper, args), total=len(args)))
+            pd.concat(farmland_dfs, ignore_index=True).to_csv(self.consolidated_stats / "farmland_statistics.csv", index=False)
+            
+            
       # with mp.Pool(processes=self.max_workers) as pool:
       #     temp_output = str(self.master_output / "_temp_buildings")
       #     args = [(basin_file, rivs, self.config['building_parquet'], temp_output, index) for index, rivs in enumerate(rivers_split)]
@@ -455,23 +471,24 @@ def run_worfklow(basin_file, config, master_output_folder):
 # ===== USAGE =====
 if __name__ == "__main__":
     # Configuration
-    basin_file = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\catchments_718.parquet"
-
+    basin_file = r"C:\Users\ricky\Downloads\catchments_718.parquet"
+    osm = r"C:\Users\ricky\Downloads\Flood_Impact_Model-selected\OSM_Parquet\central-america.parquet"
     config = {
-        'population_raster': r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\global_pop_2025_CN_1km_R2025A_UA_v1.tif",
-        'farmland_raster_folder': r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\ESA_Caribbean",
-        'building_parquet': r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\OSM_Parquet\central-america-QGIS-polygons.parquet",
-        'transportation_parquet': r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\OSM_Parquet\central-america-QGIS-lines.parquet"
+        'population_raster': r"C:\Users\ricky\Downloads\Flood_Impact_Model-selected\Population\global_pop_2025_CN_1km_R2025A_UA_v1.tif",
+        'farmland_raster_folder': r"C:\Users\ricky\Downloads\ESA_Caribbean\ESA_Caribbean",
+        'farmland_parquet': r"C:\Users\ricky\Downloads\cropland.parquet",
+        'building_parquet': osm,
+        'transportation_parquet': osm,
     }
 
-    master_output_folder = r"C:\C_Drive_Brians_Stuff\Python_Projects\Global_Impact_Analysis"
+    master_output_folder = r"C:\Users\ricky\Downloads\brian_test"
 
     # Run workflow with parallel execution (adjust max_workers based on your RAM)
     workflow = ImpactAnalysisWorkflow(
         basin_file,
         config,
         master_output_folder,
-        max_workers=4  # Adjust based on your system (4 is good for 32GB+ RAM)
+        max_workers=mp.cpu_count()  # Adjust based on your system (4 is good for 32GB+ RAM)
     )
     workflow.run_all_analyses()
 
