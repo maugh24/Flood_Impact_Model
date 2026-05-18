@@ -17,7 +17,7 @@ def vectorize(cropland_file: str, index, farmland_value=40):
     shapes = [shape(geom) for geom, val in shapes if val == farmland_value]
     gdf = gpd.GeoDataFrame(geometry=shapes, crs=4326)
     gdf = gdf.to_crs({'proj': 'cea'})
-    out_file = rf"C:\Users\ricky\Downloads\cropland_{index}.parquet"
+    out_file = rf"C:\C_Drive_Brians_Stuff\Python_Projects\Files\ESA_Parquet\cropland_{index}.parquet"
     gdf.to_parquet(out_file)
     return out_file
 
@@ -27,12 +27,12 @@ def vectorize_wrapper(args):
 if __name__ == "__main__":
     # A bit memory hungry:
     # ~3.75 GB per core peak, ~7 mins for 28 files with 16 cores (60 GB peak memory)
-    cropland_files = glob.glob(r"C:\Users\ricky\Downloads\ESA_Caribbean\ESA_Caribbean\*.tif")
-    with mp.Pool(mp.cpu_count()) as pool:
+    cropland_files = glob.glob(r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\ESA_Raster\*.tif")
+    with mp.Pool(processes=4) as pool:
         results = list(tqdm.tqdm(pool.imap_unordered(vectorize_wrapper, [(file, idx) for idx, file in enumerate(cropland_files)]), total=len(cropland_files)))
     (
         gpd.GeoDataFrame(pd.concat([gpd.read_parquet(file) for file in results], ignore_index=True, copy=False))
-        .to_parquet(r"C:\Users\ricky\Downloads\cropland.parquet")
+        .to_parquet(r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\ESA_Parquet\cropland.parquet")
     )
     for file in results:
         os.remove(file)

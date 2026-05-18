@@ -1,23 +1,22 @@
+from operator import truediv
+
 import geopandas as gpd
 import pandas as pd
 from pathlib import Path
-import shutil
 import time
 from datetime import datetime
 import warnings
-import rasterio
 import multiprocessing as mp
 import numpy as np
-from sklearn.cluster import KMeans
 import tqdm
 
 warnings.filterwarnings('ignore')
 
 # Import your four impact models
-from Population_Impact import calculate_basin_population
-from Farmland_Impact import calculate_basin_farmland, calculate_basin_farmland_wrapper
-from Building_Impact import calculate_basin_buildings
-from Road_Impact import calculate_basin_transportation
+from Population_Impact import calculate_basin_population_wrapper
+from Farmland_Impact import calculate_basin_farmland_wrapper
+from Building_Impact import calculate_basin_building_wrapper
+from Road_Impact import calculate_basin_transportation_wrapper
 
 
 class ImpactAnalysisWorkflow:
@@ -48,8 +47,7 @@ class ImpactAnalysisWorkflow:
 
         # Create master output folder structure
         self.master_output.mkdir(parents=True, exist_ok=True)
-        self.consolidated_gpkg = self.master_output / "consolidated_impacts.gpkg"
-        self.consolidated_stats = self.master_output / "consolidated_statistics"
+        self.consolidated_stats = self.master_output / "Statistics"
         self.consolidated_stats.mkdir(exist_ok=True)
 
         # Tracking
@@ -64,7 +62,7 @@ class ImpactAnalysisWorkflow:
         distance_from_0_0 = np.sqrt(centroid.x**2 + centroid.y**2)
         gdf['distance_from_0_0'] = distance_from_0_0
         gdf = gdf.sort_values('distance_from_0_0')
-        # gdf.to_parquet(self.master_output / "sorted_basins.parquet") # optional, for debugging
+        gdf.to_parquet(self.master_output / "sorted_basins.parquet") # optional, for debugging
         return gdf['linkno'].tolist()
 
     # @profile
@@ -82,382 +80,74 @@ class ImpactAnalysisWorkflow:
         # self.basins = gpd.read_parquet(self.basin_file)
         self.start_time = time.time()
 
-        # Define analyses to run
-        # analyses = {
-        #     "Population": self._run_population_analysis,
-        #     "Farmland": self._run_farmland_analysis,
-        #     "Buildings": self._run_building_analysis,
-        #     "Transportation": self._run_transportation_analysis
-        # }
-
         # Run analyses in parallel
         # Sort so that basins are processed in a consistent order (top to bottom, left to right)
-        n = 50 # Sweet spot?
+        n = 100 # Sweet spot?
         rivers = self.get_sorted_rivids() # 6:32 kmeans, 5:55 hilbert, 4:44 distance from 0,0
         rivers_split = [rivers[i:i+n] for i in range(0, len(rivers), n)]
         with mp.Pool(processes=self.max_workers) as pool:
-      #     temp_output = str(self.master_output / "_temp_population")
-      #     args = [(basin_file, rivs, self.config['population_raster'], temp_output, index) for index, rivs in enumerate(rivers_split)]
-      #     pool.starmap(calculate_basin_population, args)
-
-            # 16 cores == 29 GB peak memory
-            args = [(basin_file, rivs, self.config['farmland_parquet']) for rivs in rivers_split]
-            farmland_dfs = list(tqdm.tqdm(pool.imap_unordered(calculate_basin_farmland_wrapper, args), total=len(args)))
-            pd.concat(farmland_dfs, ignore_index=True).to_csv(self.consolidated_stats / "farmland_statistics.csv", index=False)
-            
-            
-      # with mp.Pool(processes=self.max_workers) as pool:
-      #     temp_output = str(self.master_output / "_temp_buildings")
-      #     args = [(basin_file, rivs, self.config['building_parquet'], temp_output, index) for index, rivs in enumerate(rivers_split)]
-      #     pool.starmap(calculate_basin_buildings, args)
-      # with mp.Pool(processes=self.max_workers) as pool:
-      #     temp_output = str(self.master_output / "_temp_transportation")
-      #     args = [(basin_file, rivs, self.config['transportation_parquet'], temp_output, index) for index, rivs in enumerate(rivers_split)]
-      #     pool.starmap(calculate_basin_transportation, args)
-        # self._run_population_analysis()
-        # self._run_farmland_analysis()
-        # self._run_building_analysis()
-        # self._run_transportation_analysis()
-
-
-        self.end_time = time.time()
-
-        # Consolidate outputs
-        print(f"\n{'=' * 80}")
-        print("CONSOLIDATING OUTPUTS")
-        print(f"{'=' * 80}")
-        self._consolidate_outputs()
-
-        # Print final summary
-        self._print_summary()
-
-    def _run_population_analysis(self):
-        """Run population impact analysis."""
-        print(f"[Population] Starting analysis...")
-        temp_output = self.master_output / "_temp_population"
-
-        result = calculate_basin_population(
-            self.basins,
-            self.config['population_raster'],
-            str(temp_output)
-        )
-
-        print(f"[Population] Analysis complete!")
-        return {'temp_folder': temp_output, 'stats': result}
-
-    def _run_farmland_analysis(self):
-        """Run farmland impact analysis."""
-        print(f"[Farmland] Starting analysis...")
-        temp_output = self.master_output / "_temp_farmland"
-
-        result = calculate_basin_farmland(
-            self.basins,
-            self.config['farmland_raster_folder'],
-            str(temp_output),
-            farmland_value=40
-        )
-
-        print(f"[Farmland] Analysis complete!")
-        return {'temp_folder': temp_output, 'stats': result}
-
-    def _run_building_analysis(self):
-        """Run building impact analysis."""
-        print(f"[Buildings] Starting analysis...")
-        temp_output = self.master_output / "_temp_buildings"
-
-        result = calculate_basin_buildings(
-            self.basins,
-            self.config['building_parquet'],
-            str(temp_output)
-        )
-
-        print(f"[Buildings] Analysis complete!")
-        return {'temp_folder': temp_output, 'stats': result}
-
-    def _run_transportation_analysis(self):
-        """Run transportation impact analysis."""
-        print(f"[Transportation] Starting analysis...")
-        temp_output = self.master_output / "_temp_transportation"
-
-        result = calculate_basin_transportation(
-            self.basins,
-            self.config['transportation_parquet'],
-            str(temp_output)
-        )
-
-        print(f"[Transportation] Analysis complete!")
-        return {'temp_folder': temp_output, 'stats': result}
-
-    def _consolidate_outputs(self):
-        """Consolidate all outputs into master GeoPackage (including rasters) and statistics folder."""
-
-        print("\n1. Consolidating vector outputs into master GeoPackage...")
-
-        # Track what we're adding
-        layers_added = []
-
-        for analysis_name, result_data in self.results.items():
-            if result_data['status'] != 'SUCCESS':
-                continue
-
-            temp_folder = result_data['result']['temp_folder']
-
-            # Find GeoPackage files
-            gpkg_files = list(temp_folder.glob("*.gpkg"))
-
-            for gpkg_file in gpkg_files:
-                print(f"\n   Processing: {analysis_name} - {gpkg_file.name}")
-
-                # Read all layers from this GeoPackage
-                import fiona
-                try:
-                    layers = fiona.listlayers(str(gpkg_file))
-
-                    for layer in layers:
-                        gdf = gpd.read_file(gpkg_file, layer=layer)
-
-                        # Create descriptive layer name
-                        layer_name = f"{analysis_name.lower()}_{layer}"
-
-                        # Write to consolidated GeoPackage
-                        gdf.to_file(
-                            self.consolidated_gpkg,
-                            driver='GPKG',
-                            layer=layer_name
-                        )
-
-                        layers_added.append({
-                            'analysis': analysis_name,
-                            'layer': layer_name,
-                            'type': 'vector',
-                            'features': len(gdf)
-                        })
-
-                        print(f"     ✓ Added vector layer: {layer_name} ({len(gdf):,} features)")
-
-                except Exception as e:
-                    print(f"     ✗ Error reading {gpkg_file.name}: {e}")
-
-        # Add raster files to GeoPackage as raster layers
-        print("\n2. Adding raster outputs to GeoPackage...")
-
-        for analysis_name, result_data in self.results.items():
-            if result_data['status'] != 'SUCCESS':
-                continue
-
-            temp_folder = result_data['result']['temp_folder']
-
-            # Find TIF files
-            tif_files = list(temp_folder.glob("*.tif"))
-
-            for tif_file in tif_files:
-                try:
-                    # Read the raster
-                    with rasterio.open(tif_file) as src:
-                        raster_data = src.read()
-                        profile = src.profile
-
-                        # Convert raster to GeoDataFrame of raster pixels (for GeoPackage compatibility)
-                        # Note: This creates a gridded point layer representing the raster
-                        layer_name = f"{analysis_name.lower()}_raster_{tif_file.stem}"
-
-                        # Alternative 1: Store raster metadata as a table
-                        self._add_raster_metadata_to_gpkg(
-                            tif_file,
-                            layer_name,
-                            profile,
-                            analysis_name
-                        )
-
-                        layers_added.append({
-                            'analysis': analysis_name,
-                            'layer': layer_name + '_metadata',
-                            'type': 'raster_metadata',
-                            'features': 1
-                        })
-
-                        print(f"     ✓ Added raster metadata: {layer_name}_metadata")
-
-                        # Also keep a copy of the actual raster file alongside the GeoPackage
-                        dest_name = f"{analysis_name.lower()}_{tif_file.name}"
-                        dest_path = self.master_output / dest_name
-                        shutil.copy2(tif_file, dest_path)
-                        print(f"     ✓ Copied raster file: {dest_name}")
-
-                except Exception as e:
-                    print(f"     ✗ Error processing raster {tif_file.name}: {e}")
-
-        # Consolidate statistics CSVs
-        print("\n3. Consolidating statistics CSVs...")
-
-        for analysis_name, result_data in self.results.items():
-            if result_data['status'] != 'SUCCESS':
-                continue
-
-            temp_folder = result_data['result']['temp_folder']
-
-            # Find CSV files
-            csv_files = list(temp_folder.glob("*.csv"))
-
-            for csv_file in csv_files:
-                dest_name = f"{analysis_name.lower()}_{csv_file.name}"
-                dest_path = self.consolidated_stats / dest_name
-
-                shutil.copy2(csv_file, dest_path)
-                print(f"   ✓ Copied: {dest_name}")
-
-        # Create consolidated summary CSV
-        print("\n4. Creating master summary CSV...")
-        self._create_master_summary(layers_added)
-
-        # Clean up temp folders
-        print("\n5. Cleaning up temporary folders...")
-        for analysis_name, result_data in self.results.items():
-            if result_data['status'] == 'SUCCESS':
-                temp_folder = result_data['result']['temp_folder']
-                if temp_folder.exists():
-                    shutil.rmtree(temp_folder)
-                    print(f"   ✓ Removed: {temp_folder.name}")
-
-    def _add_raster_metadata_to_gpkg(self, raster_file, layer_name, profile, analysis_name):
-        """Add raster metadata as a table in the GeoPackage."""
-
-        with rasterio.open(raster_file) as src:
-            # Create metadata dictionary
-            metadata = {
-                'analysis': [analysis_name],
-                'layer_name': [layer_name],
-                'raster_file': [raster_file.name],
-                'width': [src.width],
-                'height': [src.height],
-                'crs': [str(src.crs)],
-                # 'transform': [str(src.transform)],
-                'bounds_minx': [src.bounds.left],
-                'bounds_miny': [src.bounds.bottom],
-                'bounds_maxx': [src.bounds.right],
-                'bounds_maxy': [src.bounds.top],
-                'nodata': [src.nodata],
-                'dtype': [str(src.dtypes[0])],
-                'count': [src.count]
-            }
-
-            # Create DataFrame
-            metadata_df = pd.DataFrame(metadata)
-
-            # Create a simple point geometry at raster center for GeoPackage compatibility
-            center_x = (src.bounds.left + src.bounds.right) / 2
-            center_y = (src.bounds.bottom + src.bounds.top) / 2
-
-            from shapely.geometry import Point
-            metadata_df['geometry'] = [Point(center_x, center_y)]
-
-            # Convert to GeoDataFrame
-            metadata_gdf = gpd.GeoDataFrame(metadata_df, geometry='geometry', crs=src.crs)
-
-            # Write to GeoPackage
-            metadata_gdf.to_file(
-                self.consolidated_gpkg,
-                driver='GPKG',
-                layer=f"{layer_name}_metadata"
-            )
-
-    def _create_master_summary(self, layers_added):
-        """Create a master summary CSV with all results."""
-
-        summary_data = []
-
-        # Add analysis summaries
-        for analysis_name, result_data in self.results.items():
-            if result_data['status'] == 'SUCCESS':
-                stats = result_data['result']['stats']
-                duration = result_data['duration']
-
-                summary_data.append({
-                    'analysis': analysis_name,
-                    'status': 'SUCCESS',
-                    'duration_seconds': round(duration, 2),
-                    'duration_formatted': self._format_duration(duration)
-                })
-            else:
-                summary_data.append({
-                    'analysis': analysis_name,
-                    'status': 'FAILED',
-                    'error': result_data.get('error', 'Unknown error'),
-                    'duration_seconds': 0,
-                    'duration_formatted': 'N/A'
-                })
-
-        summary_df = pd.DataFrame(summary_data)
-        summary_csv = self.master_output / "workflow_summary.csv"
-        summary_df.to_csv(summary_csv, index=False)
-
-        print(f"   ✓ Created: {summary_csv.name}")
-
-        # Create layer inventory
-        if layers_added:
-            layers_df = pd.DataFrame(layers_added)
-            layers_csv = self.master_output / "layer_inventory.csv"
-            layers_df.to_csv(layers_csv, index=False)
-            print(f"   ✓ Created: {layers_csv.name}")
-
-    def _print_summary(self):
-        """Print final workflow summary."""
-
-        total_duration = self.end_time - self.start_time
-
-        print("\n" + "=" * 80)
-        print("WORKFLOW SUMMARY")
-        print("=" * 80)
-
-        print(f"\nTotal duration: {self._format_duration(total_duration)}")
-        print(f"  (Parallel execution with {self.max_workers} workers)")
-        print(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-        print("\nAnalysis Results:")
-        successful = 0
-        failed = 0
-
-        for name, result in self.results.items():
-            status_symbol = "✓" if result['status'] == 'SUCCESS' else "✗"
-            duration_str = self._format_duration(result['duration']) if result['status'] == 'SUCCESS' else "N/A"
-            print(f"  {status_symbol} {name:15} - {result['status']:8} ({duration_str})")
-
-            if result['status'] == 'SUCCESS':
-                successful += 1
-            else:
-                failed += 1
-
-        print(f"\nSuccess: {successful}/{len(self.results)}")
-        if failed > 0:
-            print(f"Failed:  {failed}/{len(self.results)}")
-
-        print(f"\nOutputs consolidated in: {self.master_output}")
-        print("\nFiles created:")
-        print(f"  1. consolidated_impacts.gpkg (all spatial outputs + raster metadata)")
-        print(f"  2. consolidated_statistics/ (all CSV files)")
-        print(f"  3. *_affected.tif (raster files - referenced in GPKG)")
-        print(f"  4. workflow_summary.csv (analysis metadata)")
-        print(f"  5. layer_inventory.csv (GeoPackage layer details)")
-
-        # Calculate speedup estimate
-        if all(r['status'] == 'SUCCESS' for r in self.results.values()):
-            sequential_time = sum(r['duration'] for r in self.results.values())
-            speedup = sequential_time / total_duration
-            print(f"\nEstimated speedup: {speedup:.1f}x faster than sequential execution")
-
-        print("=" * 80)
-
-    @staticmethod
-    def _format_duration(seconds):
-        """Format duration in human-readable format."""
-        if seconds < 60:
-            return f"{seconds:.1f}s"
-        elif seconds < 3600:
-            minutes = seconds / 60
-            return f"{minutes:.1f}m"
-        else:
-            hours = seconds / 3600
-            return f"{hours:.1f}h"
+             #Population
+             args = [(basin_file, rivs, self.config['population_parquet']) for rivs in rivers_split]
+             population_dfs = list(tqdm.tqdm(pool.imap_unordered(calculate_basin_population_wrapper, args), total=len(args),desc="Population"))
+             population_result = pd.concat(population_dfs, ignore_index=True)
+             population_gdf = gpd.GeoDataFrame(
+                 population_result,
+                 geometry=gpd.points_from_xy(population_result['x'], population_result['y']),
+                 crs='EPSG:4326'
+             )
+             population_gdf.to_parquet(self.consolidated_stats / "population_statistics.parquet", index=False)
+             from Population_Impact import aggregate_population_for_csv
+             population_csv = aggregate_population_for_csv(population_result)
+             population_csv.to_csv(self.consolidated_stats / "population_statistics.csv", index=False)
+
+
+             #Farmland
+             args = [(basin_file, rivs, self.config['farmland_parquet']) for rivs in rivers_split]
+             farmland_gdfs = list(tqdm.tqdm(pool.imap_unordered(calculate_basin_farmland_wrapper, args), total=len(args),desc="Farmland"))
+             farmland_result = gpd.GeoDataFrame(pd.concat(farmland_gdfs, ignore_index=True), crs='EPSG:4326')
+             # Parquet keeps the per-intersection polygons (linkno, area_m2, geometry) for spatial use
+             farmland_result.to_parquet(self.consolidated_stats / "farmland_statistics.parquet", index=False)
+             # CSV is just linkno + area_m2 with a TOTAL row at the top
+             from Farmland_Impact import aggregate_farmland_for_csv
+             farmland_csv = aggregate_farmland_for_csv(farmland_result)
+             farmland_csv.to_csv(self.consolidated_stats / "farmland_statistics.csv", index=False)
+
+
+             # Buildings
+             args = [(basin_file, rivs, self.config['building_parquet']) for rivs in rivers_split]
+             building_dfs = list(tqdm.tqdm(pool.imap_unordered(calculate_basin_building_wrapper, args), total=len(args),desc="Buildings"))
+             building_result = pd.concat(building_dfs, ignore_index=True)
+
+             building_gdf = gpd.GeoDataFrame(
+                 building_result,
+                 geometry=gpd.points_from_xy(building_result['x'], building_result['y']),
+                 crs='EPSG:4326')
+
+             building_count = building_result[building_result['linkno'] != 'TOTAL'].groupby('linkno').size().reset_index(name='building_count')
+             total_buildings = building_result[building_result['linkno'] != 'TOTAL'].shape[0]
+             total_buildings_row = pd.DataFrame({'linkno': ['TOTAL'], 'building_count': [total_buildings]})
+             building_count_with_total = pd.concat([total_buildings_row, building_count], ignore_index=True)
+             building_gdf.to_parquet(self.consolidated_stats / "building_statistics.parquet", index=False)
+             building_count_with_total.to_csv(self.consolidated_stats / "building_statistics.csv", index=False)
+
+
+             # Transportation
+             args = [(basin_file, rivs, self.config['transportation_parquet']) for rivs in rivers_split]
+             transportation_dfs = list(tqdm.tqdm(pool.imap_unordered(calculate_basin_transportation_wrapper, args), total=len(args),desc="Transportation"))
+             if transportation_dfs:
+                 transportation_result = gpd.GeoDataFrame(pd.concat(transportation_dfs, ignore_index=True),
+                                                          geometry='geometry', crs='EPSG:4326')
+             else:
+                 transportation_result = gpd.GeoDataFrame(
+                     columns=['linkno', 'infrastructure_type', 'feature_value', 'length_m', 'length_km', 'geometry'],
+                     geometry='geometry', crs='EPSG:4326')
+             transportation_result.to_parquet(self.consolidated_stats / "transportation_statistics.parquet", index=False)
+             totals = transportation_result.groupby('linkno')[['length_km']].sum().reset_index()
+             totals = totals.rename(columns={'length_km': 'total_transport_km'})
+             total_sum = totals['total_transport_km'].sum()
+             total_row = pd.DataFrame({'linkno': ['TOTAL'], 'total_transport_km': [total_sum]})
+             totals_csv = pd.concat([total_row, totals], ignore_index=True)
+             totals_csv.to_csv(self.consolidated_stats / "transportation_statistics.csv", index=False)
 
 
 def run_worfklow(basin_file, config, master_output_folder):
@@ -471,29 +161,24 @@ def run_worfklow(basin_file, config, master_output_folder):
 # ===== USAGE =====
 if __name__ == "__main__":
     # Configuration
-    basin_file = r"C:\Users\ricky\Downloads\catchments_718.parquet"
-    osm = r"C:\Users\ricky\Downloads\Flood_Impact_Model-selected\OSM_Parquet\central-america.parquet"
+    basin_file = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\catchments_718.parquet"
+    osm_buildings = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\OSM_Parquet\central-america-QGIS-polygons_bbox.parquet"
+    osm_transportation = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\OSM_Parquet\central-america-QGIS-lines_bbox.parquet"
     config = {
-        'population_raster': r"C:\Users\ricky\Downloads\Flood_Impact_Model-selected\Population\global_pop_2025_CN_1km_R2025A_UA_v1.tif",
-        'farmland_raster_folder': r"C:\Users\ricky\Downloads\ESA_Caribbean\ESA_Caribbean",
-        'farmland_parquet': r"C:\Users\ricky\Downloads\cropland.parquet",
-        'building_parquet': osm,
-        'transportation_parquet': osm,
+        'population_parquet': r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\population.parquet",
+        'farmland_raster_folder': r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\ESA_Raster",
+        'farmland_parquet': r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\ESA_Parquet\cropland.parquet",
+        'building_parquet': osm_buildings,
+        'transportation_parquet': osm_transportation,
     }
 
-    master_output_folder = r"C:\Users\ricky\Downloads\brian_test"
+    master_output_folder = r"C:\C_Drive_Brians_Stuff\Python_Projects\Impact_Analysis_Results"
 
     # Run workflow with parallel execution (adjust max_workers based on your RAM)
     workflow = ImpactAnalysisWorkflow(
         basin_file,
         config,
         master_output_folder,
-        max_workers=mp.cpu_count()  # Adjust based on your system (4 is good for 32GB+ RAM)
+        max_workers=mp.cpu_count()//3 # Adjust based on your system (4 is good for 32GB+ RAM)
     )
     workflow.run_all_analyses()
-
-
-    # basins = [...]
-    # args = [(basin_file, config, master_output_folder) for basin_file in basins]
-    # with mp.Pool(processes=4) as pool:
-    #     pool.starmap(run_worfklow, args)

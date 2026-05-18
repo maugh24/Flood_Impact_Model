@@ -2,60 +2,104 @@ import geopandas as gpd
 import pandas as pd
 
 _FARM_GDF: gpd.GeoDataFrame = None
+
+
+def _empty_result(rivers):
+    """Schema-stable empty return for early-exit paths."""
+    return gpd.GeoDataFrame({
+        'linkno': rivers,
+        'area_m2': [None] * len(rivers),
+        'geometry': [None] * len(rivers)
+    }, crs='EPSG:4326')
+
+
 def get_farmland_gdf(farmland_parquet):
-    # This means each process only reads the farm parquet once
     global _FARM_GDF
     if _FARM_GDF is None:
         _FARM_GDF = gpd.read_parquet(farmland_parquet)
     return _FARM_GDF
 
-# @profile
+
 def calculate_basin_farmland(basin_file, rivers, farmland_parquet):
-    # ===== READ BASINS =====
-    # Get first raster's CRS and reproject basins once
-    basins = gpd.read_parquet(basin_file, filters=[('linkno', 'in', rivers)]).to_crs({'proj': 'cea'})
+    basins = gpd.read_parquet(basin_file, filters=[('linkno', 'in', rivers)])
 
-    # Get farmland GeoDataFrame (cached in memory after first read)
+    if len(basins) == 0:
+        return _empty_result(rivers)
+
+    # Get cached farmland data
     farm_gdf = get_farmland_gdf(farmland_parquet)
-    
-    # Filter farmland to only the basins of interest (spatial index is used automatically by geopandas and is fast)
-    farm_gdf = (
-        gpd.sjoin(farm_gdf, basins[['geometry']], how='inner', predicate='intersects')
-        .drop(columns=['index_right'])
-        .to_crs({'proj': 'cea'}) # This projection is correctly in meters, so area calculations will be accurate
-    )
-    
-    # Find the area of farmland intersecting each basin
-    intersections = gpd.overlay(basins, farm_gdf, how="intersection")
-    intersections["area_m2"] = intersections.geometry.area
-    result = (
-        intersections
-        .groupby("linkno")["area_m2"]
-        .sum()
-        .reset_index()
-    )
-    
-    # Add dropped linknos with 0 area
-    missing_linknos = set(rivers) - set(result['linkno'])
-    if missing_linknos:
-        result = pd.concat([result, pd.DataFrame({'linkno': list(missing_linknos), 'area_m2': 0})], ignore_index=True)
-    
-    result['area_km2'] = result['area_m2'] / 1e6
 
-    return result[['linkno', 'area_km2']]
+    if len(farm_gdf) == 0 or 'geometry' not in farm_gdf.columns:
+        return _empty_result(rivers)
+
+    # Ensure same CRS
+    if farm_gdf.crs != basins.crs:
+        farm_gdf = farm_gdf.to_crs(basins.crs)
+
+    # Spatial join for quick filtering. sjoin duplicates the LEFT (farm) row
+    # once per matching basin, so a farm polygon spanning N basins shows up N
+    # times. If we hand that to overlay, every basin gets intersected with
+    # each duplicate copy and the resulting intersection geometries are
+    # double-counted. Deduplicate by the original farm index before overlay.
+    farm_in_basins = gpd.sjoin(
+        farm_gdf,
+        basins[['geometry']],
+        how='inner',
+        predicate='intersects'
+    )
+    farm_in_basins = farm_in_basins[~farm_in_basins.index.duplicated(keep='first')]
+    farm_in_basins = farm_in_basins.drop(columns='index_right')
+
+    if len(farm_in_basins) == 0:
+        return _empty_result(rivers)
+
+    # Project to equal area CRS for accurate area calculation
+    basins_cea = basins.to_crs({'proj': 'cea'})
+    farm_in_basins_cea = farm_in_basins.to_crs({'proj': 'cea'})
+
+    # Overlay creates intersection polygons (clips farmland to basin boundaries)
+    intersections = gpd.overlay(basins_cea, farm_in_basins_cea, how="intersection")
+
+    if len(intersections) == 0:
+        return _empty_result(rivers)
+
+    # Calculate area in m^2 (CEA projection units). Single source of truth -
+    # convert to other units at the output layer if needed.
+    intersections['area_m2'] = intersections.geometry.area
+
+    # Reproject polygons back to WGS84 for visualization
+    intersections_wgs84 = intersections.to_crs('EPSG:4326')
+
+    # Select final columns (keep geometry as polygons)
+    result = intersections_wgs84[['linkno', 'area_m2', 'geometry']].copy()
+
+    # Add missing linknos (basins with no farmland)
+    missing_linknos = set(rivers) - set(result['linkno'])
+
+    if missing_linknos:
+        missing_gdf = gpd.GeoDataFrame({
+            'linkno': list(missing_linknos),
+            'area_m2': [None] * len(missing_linknos),
+            'geometry': [None] * len(missing_linknos)
+        }, crs='EPSG:4326')
+        result = pd.concat([result, missing_gdf], ignore_index=True)
+
+    return result
+
 
 def calculate_basin_farmland_wrapper(args):
     return calculate_basin_farmland(*args)
 
-# Usage
-if __name__ == "__main__":
-    basin_file = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\catchments_718.parquet"
-    farmland_raster_folder = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\ESA_Caribbean"
-    output_folder = r"C:\C_Drive_Brians_Stuff\Python_Projects\Farmland_Impact"
 
-    results = calculate_basin_farmland(
-        basin_file,
-        farmland_raster_folder,
-        output_folder,
-        farmland_value=40
-    )
+def aggregate_farmland_for_csv(farmland_result):
+    """Collapse the per-intersection farmland_result into one row per basin
+    for CSV export. Output has exactly two columns: linkno and area_m2.
+    A TOTAL row is prepended. Basins with no farmland keep a NaN area row
+    (min_count=1 prevents the sum from collapsing missing data to 0)."""
+    df = pd.DataFrame(farmland_result.drop(columns='geometry', errors='ignore'))
+
+    per_basin = df.groupby('linkno', dropna=False, as_index=False)['area_m2'].sum(min_count=1)
+
+    total = per_basin['area_m2'].sum(min_count=1)
+    total_row = pd.DataFrame({'linkno': ['TOTAL'], 'area_m2': [total]})
+    return pd.concat([total_row, per_basin], ignore_index=True)

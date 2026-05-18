@@ -1,27 +1,38 @@
 import geopandas as gpd
 import pandas as pd
-from pathlib import Path
+import pyarrow.dataset as ds
 
-#@profile
-def calculate_basin_buildings(basin_file, rivers, building_parquet, output_folder, index):
+def calculate_basin_buildings(basin_file, rivers, building_parquet):
 
-    # Create output folder
-    output_path = Path(output_folder)
-    output_path.mkdir(parents=True, exist_ok=True)
-    print(f"Output folder: {output_path}")
-
-    # Define output files
-    output_csv = output_path / f"building_statistics{index}.csv"
-    output_gpkg = output_path / f"buildings_affected{index}.gpkg"
-
-    # ===== READ BASINS =====
     basins = gpd.read_parquet(basin_file, filters=[('linkno', 'in', rivers)])
 
-    # ===== READ BUILDING PARQUET =====
-    buildings = gpd.read_parquet(building_parquet)
+    if len(basins) == 0:
+        return pd.DataFrame(data={'building': [None]*len(rivers),
+                                  'name': [None]*len(rivers),
+                                  'amenity': [None]*len(rivers),
+                                  'linkno': rivers,
+                                   'x': [None]*len(rivers),
+                                    'y': [None]*len(rivers)})
+
+    # Get bounding box of basins for spatial filtering
+    basin_bounds = basins.total_bounds  # [minx, miny, maxx, maxy]
+
+    buildings = gpd.read_parquet(building_parquet,
+                                 columns=['building','name','amenity','geometry'],
+                                 bbox=basin_bounds,
+                                 filters=ds.field("building").is_valid()
+                                 )
+    # buildings.to_parquet(bbox_building_parquet,write_covering_bbox=True)
+
+    if len(buildings) == 0:
+        return pd.DataFrame(data={'building': [None]*len(rivers),
+                                  'name': [None]*len(rivers),
+                                  'amenity': [None]*len(rivers),
+                                  'linkno': rivers,
+                                   'x': [None]*len(rivers),
+                                    'y': [None]*len(rivers)})
 
     # ===== VECTORIZED FILTERING =====
-    # Building values we want
     building_values = [
         'yes', 'apartments', 'industrial', 'commercial', 'retail', 'residential',
         'civic', 'house', 'policlinic', 'hotel', 'stadium', 'church', 'government',
@@ -43,113 +54,52 @@ def calculate_basin_buildings(basin_file, rivers, building_parquet, output_folde
         'triumphal_arch', 'windmill'
     ]
 
-    # Simple filter - just check building column
+    # Check building column exists
     if 'building' not in buildings.columns:
-        raise ValueError("No 'building' column found in parquet file")
+        return pd.DataFrame(data={'building': [None]*len(rivers),
+                                  'name': [None]*len(rivers),
+                                  'amenity': [None]*len(rivers),
+                                  'linkno': rivers,
+                                   'x': [None]*len(rivers),
+                                    'y': [None]*len(rivers)})
 
-    # Vectorized filtering
-    buildings_filtered = buildings[buildings['building'].isin(building_values)].copy()
+    # Filter by building type
+    buildings = buildings[buildings['building'].isin(building_values)]
 
-    if len(buildings_filtered) == 0:
-        print("\nWarning: No buildings found matching filter criteria!")
-        result = pd.DataFrame({
-            'category': ['TOTAL'],
-            'building_type': ['All Buildings'],
-            'count': [0]
-        })
-        result.to_csv(output_csv, index=False)
-        return result
-
-    # Add building_type column (same as building value)
-    buildings_filtered['building_type'] = buildings_filtered['building']
+    if len(buildings) == 0:
+        return pd.DataFrame(data={'building': [None]*len(rivers),
+                                  'name': [None]*len(rivers),
+                                  'amenity': [None]*len(rivers),
+                                  'linkno': rivers,
+                                   'x': [None]*len(rivers),
+                                    'y': [None]*len(rivers)})
 
     # ===== SPATIAL JOIN WITH BASINS =====
     # Ensure same CRS
-    if buildings_filtered.crs != basins.crs:
-        buildings_filtered = buildings_filtered.to_crs(basins.crs)
+    if buildings.crs != basins.crs:
+        buildings = buildings.to_crs(basins.crs)
 
     # Vectorized spatial join
     buildings_in_basins = gpd.sjoin(
-        buildings_filtered,
+        buildings,
         basins,
         how='inner',
         predicate='intersects'
     )
 
-    if len(buildings_in_basins) == 0:
-        print("\nWarning: No buildings found within basins!")
-        result = pd.DataFrame({
-            'category': ['TOTAL'],
-            'building_type': ['All Buildings'],
-            'count': [0]
-        })
-        total_buildings = 0
-        type_counts = pd.DataFrame()
-    else:
-        # ===== EXPORT GEOPACKAGE =====
-        # Reproject to WGS84
-        buildings_for_export = buildings_in_basins.to_crs("EPSG:4326")
+    centroid = buildings_in_basins.centroid
+    buildings_in_basins['x'] = centroid.x
+    buildings_in_basins['y'] = centroid.y
+    buildings_in_basins = buildings_in_basins.drop(columns=['geometry', 'index_right'])
+    missing_linknos = set(rivers) - set(buildings_in_basins['linkno'])
+    if missing_linknos:
+        buildings_in_basins = pd.concat([buildings_in_basins, pd.DataFrame(data={'building': [None]*len(missing_linknos),
+                                  'name': [None]*len(missing_linknos),
+                                  'amenity': [None]*len(missing_linknos),
+                                  'linkno': list(missing_linknos),
+                                   'x': [None]*len(missing_linknos),
+                                    'y': [None]*len(missing_linknos)})], ignore_index=True)
+    return buildings_in_basins
 
-        # Select columns
-        export_columns = ['building_type', 'name', 'osm_id', 'geometry']
-
-        # Handle missing columns
-        available_cols = [col for col in export_columns if col in buildings_for_export.columns]
-        if 'geometry' not in available_cols:
-            available_cols.append('geometry')
-
-        buildings_export = buildings_for_export[available_cols].copy()
-
-        # Convert to centroids for point representation
-        try:
-            # Use projected CRS for accurate centroids
-            buildings_projected = buildings_export.to_crs("ESRI:54034")
-            buildings_export['geometry'] = buildings_projected.geometry.centroid
-            buildings_export = buildings_export.to_crs("EPSG:4326")
-        except Exception as e:
-            print(f"  ⚠ Could not use projected CRS: {str(e)}")
-            print("  Falling back to geographic CRS centroids")
-            buildings_export['geometry'] = buildings_export.geometry.centroid
-
-        # Save to GeoPackage
-        buildings_export.to_file(output_gpkg, driver='GPKG', layer='buildings')
-
-        # ===== CALCULATE STATISTICS (VECTORIZED) =====
-        total_buildings = len(buildings_in_basins)
-
-        # Count by building type (vectorized)
-        type_counts = buildings_in_basins['building_type'].value_counts().reset_index()
-        type_counts.columns = ['building_type', 'count']
-        type_counts = type_counts.sort_values('building_type').reset_index(drop=True)
-        type_counts['category'] = 'DETAIL'
-
-        # Create summary row
-        summary_row = pd.DataFrame({
-            'category': ['TOTAL'],
-            'building_type': ['All Buildings'],
-            'count': [total_buildings]
-        })
-
-        # Combine: summary first, then details
-        result = pd.concat(
-            [summary_row, type_counts[['category', 'building_type', 'count']]],
-            ignore_index=True
-        )
-
-    # ===== SAVE CSV =====
-    result.to_csv(output_csv, index=False)
-    return result
-
-
-# Usage
-if __name__ == "__main__":
-    basin_file = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\catchments_718.parquet"
-    building_parquet = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\OSM_Parquet\central-america-QGIS-polygons.parquet"
-
-    output_folder = r"C:\C_Drive_Brians_Stuff\Python_Projects\Building_Impact"
-
-    results = calculate_basin_buildings(
-        basin_file,
-        building_parquet,
-        output_folder
-    )
+def calculate_basin_building_wrapper(args):
+    return calculate_basin_buildings(*args)

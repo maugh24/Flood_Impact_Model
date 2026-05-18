@@ -1,99 +1,105 @@
-from pathlib import Path
 import geopandas as gpd
-import rasterio
-from rasterio.mask import mask
-import numpy as np
 import pandas as pd
-import warnings
-warnings.filterwarnings('ignore')
 
-#@profile
-def calculate_basin_population(basin_file, rivers, population_raster, output_folder, index):
 
-    # Create output folder
-    output_path = Path(output_folder)
-    output_path.mkdir(parents=True, exist_ok=True)
+def calculate_basin_population(basin_file, rivers, population_parquet):
 
-    # Define output files
-    output_csv = output_path / f"population_statistics_{index}.csv"
-    output_raster = output_path / f"population_affected_{index}.tif"
+    basins = gpd.read_parquet(basin_file, filters=[('linkno', 'in', rivers)]).to_crs(4326)
 
-    # ===== READ BASINS =====
-    basins = gpd.read_parquet(basin_file, filters=[('linkno', 'in', rivers)])
+    if len(basins) == 0:
+        return pd.DataFrame(data={
+            'linkno': rivers,
+            'pop_value': [None] * len(rivers),
+            'x': [None] * len(rivers),
+            'y': [None] * len(rivers)
+        })
 
-    # Open the raster ONCE
-    with rasterio.open(population_raster) as src:
+    bbox = basins.total_bounds
 
-        # Reproject basins if needed
-        if basins.crs != src.crs:
-            basins = basins.to_crs(src.crs)
+    pop_gdf = gpd.read_parquet(population_parquet, bbox=bbox)
 
-        # === OPTIMIZED: Process ALL basins in ONE operation ===
+    if len(pop_gdf) == 0:
+        return pd.DataFrame(data={
+            'linkno': rivers,
+            'pop_value': [None] * len(rivers),
+            'x': [None] * len(rivers),
+            'y': [None] * len(rivers)
+        })
 
-        # Get all basin geometries as a list
-        all_geometries = basins.geometry.tolist()
+    if pop_gdf.crs != basins.crs:
+        pop_gdf = pop_gdf.to_crs(basins.crs)
 
-        # Mask the raster ONCE with all basins
-        out_image, out_transform = mask(
-            src,
-            all_geometries,
-            crop=True,
-            nodata=0,
-            filled=True,
-            all_touched=True  # Include pixels that touch basin boundaries
-        )
+    # Project to equal-area CRS so area ratios are accurate
+    basins_cea = basins.to_crs({'proj': 'cea'})
+    pop_cea = pop_gdf.to_crs({'proj': 'cea'}).copy()
 
-        # Get the data (first band)
-        data = out_image[0]
+    # Record each tile's full area and full pop BEFORE overlay so we can
+    # weight by the area fraction that lands in each basin.
+    pop_cea['_tile_area'] = pop_cea.geometry.area
+    pop_cea['_tile_pop'] = pop_cea['pop_value']
 
-        # Calculate total population efficiently
-        # Use nansum to automatically handle both NaN and 0 values
-        total_population = np.nansum(data[data > 0]) if np.any(data > 0) else 0
+    # Overlay produces one row per (basin, pop_tile) intersection. A tile
+    # spanning basins A and B yields one row in A (with A's geometry) and
+    # one row in B (with B's geometry).
+    intersections = gpd.overlay(
+        basins_cea[['linkno', 'geometry']],
+        pop_cea[['_tile_area', '_tile_pop', 'geometry']],
+        how='intersection'
+    )
 
-    # === CREATE OUTPUT RASTER ===
-    if total_population > 0:
+    if len(intersections) == 0:
+        return pd.DataFrame(data={
+            'linkno': rivers,
+            'pop_value': [None] * len(rivers),
+            'x': [None] * len(rivers),
+            'y': [None] * len(rivers)
+        })
 
-        # Write the masked raster
-        out_meta = {
-            "driver": "GTiff",
-            "height": data.shape[0],
-            "width": data.shape[1],
-            "count": 1,
-            "dtype": data.dtype,
-            "crs": basins.crs,
-            "transform": out_transform,
-            "compress": "deflate",
-            "nodata": 0,
-            "tiled": True,
-            "blockxsize": 256,
-            "blockysize": 256
-        }
+    # Area-weight: pop assigned to basin = tile_pop * (clipped_area / tile_area).
+    # If 40% of the tile falls in basin A, basin A gets 40% of its population.
+    intersections['_clip_area'] = intersections.geometry.area
+    intersections['pop_value'] = (
+        intersections['_tile_pop'] * (intersections['_clip_area'] / intersections['_tile_area'])
+    )
 
-        with rasterio.open(output_raster, "w", **out_meta) as dest:
-            dest.write(data, 1)
+    # Centroid of the clipped piece, reported in WGS84 for downstream plotting.
+    intersections_wgs84 = intersections.to_crs('EPSG:4326')
+    centroid = intersections_wgs84.geometry.centroid
+    intersections_wgs84['x'] = centroid.x
+    intersections_wgs84['y'] = centroid.y
 
-    else:
-        print(f"\n⚠ No population found - skipping raster output")
+    result = intersections_wgs84[['linkno', 'pop_value', 'x', 'y']].copy()
 
-    # === CREATE STATISTICS CSV ===
+    # Add missing linknos (basins with no population overlap)
+    missing_linknos = set(rivers) - set(result['linkno'])
+    if missing_linknos:
+        missing_df = pd.DataFrame(data={
+            'linkno': list(missing_linknos),
+            'pop_value': [None] * len(missing_linknos),
+            'x': [None] * len(missing_linknos),
+            'y': [None] * len(missing_linknos)
+        })
+        result = pd.concat([result, missing_df], ignore_index=True)
 
-    # Create simple DataFrame with just the total
-    result = pd.DataFrame({
-        'total_population': [total_population]
-    })
-
-    # Save results
-    result.to_csv(output_csv, index=False)
     return result
 
-# Usage
-if __name__ == "__main__":
-    basin_file = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\catchments_718.parquet"
-    population_raster = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\global_pop_2025_CN_1km_R2025A_UA_v1.tif"
-    output_folder = r"C:\C_Drive_Brians_Stuff\Python_Projects\Population_Impact"
 
-    results = calculate_basin_population(
-        basin_file,
-        population_raster,
-        output_folder
+def calculate_basin_population_wrapper(args):
+    return calculate_basin_population(*args)
+
+
+def aggregate_population_for_csv(population_result):
+    """Collapse the per-intersection population_result into a clean CSV layout:
+    one row per basin with pop_value summed, plus a TOTAL row at the top.
+    Drops the x/y/geometry clutter used for spatial outputs."""
+    df = pd.DataFrame(population_result).drop(
+        columns=['x', 'y', 'geometry'], errors='ignore'
     )
+
+    # Sum pop_value per basin. min_count=1 keeps basins with no population as NaN
+    # rather than coercing them to 0.
+    per_basin = df.groupby('linkno', dropna=False, as_index=False)['pop_value'].sum(min_count=1)
+
+    total = per_basin['pop_value'].sum(min_count=1)
+    total_row = pd.DataFrame({'linkno': ['TOTAL'], 'pop_value': [total]})
+    return pd.concat([total_row, per_basin], ignore_index=True)
