@@ -79,17 +79,28 @@ def calculate_basin_buildings(basin_file, rivers, building_parquet):
     if buildings.crs != basins.crs:
         buildings = buildings.to_crs(basins.crs)
 
-    # Vectorized spatial join
+    # Assign each building to exactly one basin via point-in-polygon on the
+    # building's centroid. A building whose polygon happens to straddle a
+    # basin boundary used to appear in BOTH basins under the old
+    # polygon-intersects-polygon sjoin; the centroid lives in exactly one
+    # basin, so this gives each building a single home.
+    buildings_centroids = buildings.copy()
+    buildings_centroids['geometry'] = buildings.geometry.centroid
+
     buildings_in_basins = gpd.sjoin(
-        buildings,
+        buildings_centroids,
         basins,
         how='inner',
-        predicate='intersects'
+        predicate='within'
     )
 
-    centroid = buildings_in_basins.centroid
-    buildings_in_basins['x'] = centroid.x
-    buildings_in_basins['y'] = centroid.y
+    # Defensive dedup in the (rare) case a centroid lands exactly on an
+    # interior basin boundary and matches more than one polygon.
+    buildings_in_basins = buildings_in_basins[~buildings_in_basins.index.duplicated(keep='first')]
+
+    # Capture x/y straight from the centroid geometry, then drop spatial columns.
+    buildings_in_basins['x'] = buildings_in_basins.geometry.x
+    buildings_in_basins['y'] = buildings_in_basins.geometry.y
     buildings_in_basins = buildings_in_basins.drop(columns=['geometry', 'index_right'])
     missing_linknos = set(rivers) - set(buildings_in_basins['linkno'])
     if missing_linknos:

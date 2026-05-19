@@ -9,37 +9,18 @@ import warnings
 import multiprocessing as mp
 import numpy as np
 import tqdm
-
 warnings.filterwarnings('ignore')
 
 # Import your four impact models
-from Population_Impact import calculate_basin_population_wrapper
-from Farmland_Impact import calculate_basin_farmland_wrapper
+from Population_Impact import calculate_basin_population_wrapper, aggregate_population_for_csv
+from Farmland_Impact import calculate_basin_farmland_wrapper, aggregate_farmland_for_csv
 from Building_Impact import calculate_basin_building_wrapper
-from Road_Impact import calculate_basin_transportation_wrapper
+from Road_Impact import calculate_basin_transportation_wrapper, aggregate_transportation_for_csv
 
 
 class ImpactAnalysisWorkflow:
-    """
-    Workflow manager for running all impact analyses in parallel and consolidating outputs.
-    Includes rasters embedded in GeoPackage.
-    """
-
     def __init__(self, basin_file, config, master_output_folder, max_workers=4):
-        """
-        Initialize the workflow.
 
-        Parameters:
-        -----------
-        basin_file : str
-            Path to basin parquet file
-        config : dict
-            Configuration dictionary with paths to input data
-        master_output_folder : str
-            Path to master output folder for all results
-        max_workers : int
-            Number of parallel processes (default: 4)
-        """
         self.basin_file = basin_file
         self.config = config
         self.master_output = Path(master_output_folder)
@@ -88,7 +69,7 @@ class ImpactAnalysisWorkflow:
         with mp.Pool(processes=self.max_workers) as pool:
              #Population
              args = [(basin_file, rivs, self.config['population_parquet']) for rivs in rivers_split]
-             population_dfs = list(tqdm.tqdm(pool.imap_unordered(calculate_basin_population_wrapper, args), total=len(args),desc="Population"))
+             population_dfs = list(tqdm.tqdm(pool.imap_unordered(calculate_basin_population_wrapper, args), total=len(args),desc="Population    "))
              population_result = pd.concat(population_dfs, ignore_index=True)
              population_gdf = gpd.GeoDataFrame(
                  population_result,
@@ -96,26 +77,22 @@ class ImpactAnalysisWorkflow:
                  crs='EPSG:4326'
              )
              population_gdf.to_parquet(self.consolidated_stats / "population_statistics.parquet", index=False)
-             from Population_Impact import aggregate_population_for_csv
              population_csv = aggregate_population_for_csv(population_result)
              population_csv.to_csv(self.consolidated_stats / "population_statistics.csv", index=False)
 
 
              #Farmland
              args = [(basin_file, rivs, self.config['farmland_parquet']) for rivs in rivers_split]
-             farmland_gdfs = list(tqdm.tqdm(pool.imap_unordered(calculate_basin_farmland_wrapper, args), total=len(args),desc="Farmland"))
+             farmland_gdfs = list(tqdm.tqdm(pool.imap_unordered(calculate_basin_farmland_wrapper, args), total=len(args),desc="Farmland      "))
              farmland_result = gpd.GeoDataFrame(pd.concat(farmland_gdfs, ignore_index=True), crs='EPSG:4326')
-             # Parquet keeps the per-intersection polygons (linkno, area_m2, geometry) for spatial use
              farmland_result.to_parquet(self.consolidated_stats / "farmland_statistics.parquet", index=False)
-             # CSV is just linkno + area_m2 with a TOTAL row at the top
-             from Farmland_Impact import aggregate_farmland_for_csv
              farmland_csv = aggregate_farmland_for_csv(farmland_result)
              farmland_csv.to_csv(self.consolidated_stats / "farmland_statistics.csv", index=False)
 
 
              # Buildings
              args = [(basin_file, rivs, self.config['building_parquet']) for rivs in rivers_split]
-             building_dfs = list(tqdm.tqdm(pool.imap_unordered(calculate_basin_building_wrapper, args), total=len(args),desc="Buildings"))
+             building_dfs = list(tqdm.tqdm(pool.imap_unordered(calculate_basin_building_wrapper, args), total=len(args),desc="Buildings     "))
              building_result = pd.concat(building_dfs, ignore_index=True)
 
              building_gdf = gpd.GeoDataFrame(
@@ -142,12 +119,8 @@ class ImpactAnalysisWorkflow:
                      columns=['linkno', 'infrastructure_type', 'feature_value', 'length_m', 'length_km', 'geometry'],
                      geometry='geometry', crs='EPSG:4326')
              transportation_result.to_parquet(self.consolidated_stats / "transportation_statistics.parquet", index=False)
-             totals = transportation_result.groupby('linkno')[['length_km']].sum().reset_index()
-             totals = totals.rename(columns={'length_km': 'total_transport_km'})
-             total_sum = totals['total_transport_km'].sum()
-             total_row = pd.DataFrame({'linkno': ['TOTAL'], 'total_transport_km': [total_sum]})
-             totals_csv = pd.concat([total_row, totals], ignore_index=True)
-             totals_csv.to_csv(self.consolidated_stats / "transportation_statistics.csv", index=False)
+             transport_csv = aggregate_transportation_for_csv(transportation_result)
+             transport_csv.to_csv(self.consolidated_stats / "transportation_statistics.csv", index=False)
 
 
 def run_worfklow(basin_file, config, master_output_folder):
@@ -166,7 +139,6 @@ if __name__ == "__main__":
     osm_transportation = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\OSM_Parquet\central-america-QGIS-lines_bbox.parquet"
     config = {
         'population_parquet': r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\population.parquet",
-        'farmland_raster_folder': r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\ESA_Raster",
         'farmland_parquet': r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\ESA_Parquet\cropland.parquet",
         'building_parquet': osm_buildings,
         'transportation_parquet': osm_transportation,
