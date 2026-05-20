@@ -68,8 +68,8 @@ def reclassify_and_vectorize(flood_raster, output_parquet):
 
 if __name__ == "__main__":
     # ---- UPDATE THESE TWO PATHS TO YOUR FILES ----
-    input_tif = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\flood_extent.tif"
-    output_pq = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\flood.parquet"
+    input_tif = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\sula_valley_honduras_100_year_rp.tif"
+    output_pq = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\sula_valley_honduras_100_year_rp.parquet"
     # ----------------------------------------------
 
     if Path(input_tif).exists():
