@@ -1,30 +1,45 @@
+import os
 import geopandas as gpd
 import pandas as pd
 
+from tile_loader import read_tiles_in_bbox, resolve_source
 
-def calculate_basin_population(basin_file, rivers, population_parquet):
 
-    basins = gpd.read_parquet(basin_file, filters=[('linkno', 'in', rivers)]).to_crs(4326)
+def _empty_result(rivers):
+    return pd.DataFrame(data={
+        'LINKNO': rivers,
+        'pop_value': [None] * len(rivers),
+        'x': [None] * len(rivers),
+        'y': [None] * len(rivers)
+    })
+
+
+def _load_population(population_source, bbox):
+    """Read population tiles inside bbox.
+
+    population_source may be a folder of tiled population parquets or a
+    single pre-merged parquet (current case). Defensive support for both
+    lets us drop in a tiled population dataset later without changing
+    this module.
+    """
+    folder, fallback_path = resolve_source(population_source, '*.parquet')
+    if folder is not None:
+        return read_tiles_in_bbox(folder, '*.parquet', bbox=tuple(bbox))
+    return gpd.read_parquet(fallback_path, bbox=tuple(bbox))
+
+
+def calculate_basin_population(basin_file, rivers, population_source):
+    basins = gpd.read_parquet(basin_file, filters=[('LINKNO', 'in', rivers)]).to_crs(4326)
 
     if len(basins) == 0:
-        return pd.DataFrame(data={
-            'linkno': rivers,
-            'pop_value': [None] * len(rivers),
-            'x': [None] * len(rivers),
-            'y': [None] * len(rivers)
-        })
+        return _empty_result(rivers)
 
     bbox = basins.total_bounds
 
-    pop_gdf = gpd.read_parquet(population_parquet, bbox=bbox)
+    pop_gdf = _load_population(population_source, bbox)
 
     if len(pop_gdf) == 0:
-        return pd.DataFrame(data={
-            'linkno': rivers,
-            'pop_value': [None] * len(rivers),
-            'x': [None] * len(rivers),
-            'y': [None] * len(rivers)
-        })
+        return _empty_result(rivers)
 
     if pop_gdf.crs != basins.crs:
         pop_gdf = pop_gdf.to_crs(basins.crs)
@@ -38,25 +53,16 @@ def calculate_basin_population(basin_file, rivers, population_parquet):
     pop_cea['_tile_area'] = pop_cea.geometry.area
     pop_cea['_tile_pop'] = pop_cea['pop_value']
 
-    # Overlay produces one row per (basin, pop_tile) intersection. A tile
-    # spanning basins A and B yields one row in A (with A's geometry) and
-    # one row in B (with B's geometry).
     intersections = gpd.overlay(
-        basins_cea[['linkno', 'geometry']],
+        basins_cea[['LINKNO', 'geometry']],
         pop_cea[['_tile_area', '_tile_pop', 'geometry']],
         how='intersection'
     )
 
     if len(intersections) == 0:
-        return pd.DataFrame(data={
-            'linkno': rivers,
-            'pop_value': [None] * len(rivers),
-            'x': [None] * len(rivers),
-            'y': [None] * len(rivers)
-        })
+        return _empty_result(rivers)
 
     # Area-weight: pop assigned to basin = tile_pop * (clipped_area / tile_area).
-    # If 40% of the tile falls in basin A, basin A gets 40% of its population.
     intersections['_clip_area'] = intersections.geometry.area
     intersections['pop_value'] = (
         intersections['_tile_pop'] * (intersections['_clip_area'] / intersections['_tile_area'])
@@ -68,13 +74,13 @@ def calculate_basin_population(basin_file, rivers, population_parquet):
     intersections_wgs84['x'] = centroid.x
     intersections_wgs84['y'] = centroid.y
 
-    result = intersections_wgs84[['linkno', 'pop_value', 'x', 'y']].copy()
+    result = intersections_wgs84[['LINKNO', 'pop_value', 'x', 'y']].copy()
 
-    # Add missing linknos (basins with no population overlap)
-    missing_linknos = set(rivers) - set(result['linkno'])
+    # Add missing LINKNOs (basins with no population overlap)
+    missing_linknos = set(rivers) - set(result['LINKNO'])
     if missing_linknos:
         missing_df = pd.DataFrame(data={
-            'linkno': list(missing_linknos),
+            'LINKNO': list(missing_linknos),
             'pop_value': [None] * len(missing_linknos),
             'x': [None] * len(missing_linknos),
             'y': [None] * len(missing_linknos)
@@ -89,17 +95,13 @@ def calculate_basin_population_wrapper(args):
 
 
 def aggregate_population_for_csv(population_result):
-    """Collapse the per-intersection population_result into a clean CSV layout:
-    one row per basin with pop_value summed, plus a TOTAL row at the top.
-    Drops the x/y/geometry clutter used for spatial outputs."""
+    """Per-basin pop_value sums with a TOTAL row."""
     df = pd.DataFrame(population_result).drop(
         columns=['x', 'y', 'geometry'], errors='ignore'
     )
 
-    # Sum pop_value per basin. min_count=1 keeps basins with no population as NaN
-    # rather than coercing them to 0.
-    per_basin = df.groupby('linkno', dropna=False, as_index=False)['pop_value'].sum(min_count=1)
+    per_basin = df.groupby('LINKNO', dropna=False, as_index=False)['pop_value'].sum(min_count=1)
 
     total = per_basin['pop_value'].sum(min_count=1)
-    total_row = pd.DataFrame({'linkno': ['TOTAL'], 'pop_value': [total]})
+    total_row = pd.DataFrame({'LINKNO': ['TOTAL'], 'pop_value': [total]})
     return pd.concat([total_row, per_basin], ignore_index=True)

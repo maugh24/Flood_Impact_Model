@@ -1,33 +1,43 @@
+import os
 import geopandas as gpd
 import pandas as pd
 
-_FARM_GDF: gpd.GeoDataFrame = None
+from tile_loader import read_tiles_in_bbox, resolve_source
 
 
 def _empty_result(rivers):
     """Schema-stable empty return for early-exit paths."""
     return gpd.GeoDataFrame({
-        'linkno': rivers,
+        'LINKNO': rivers,
         'area_m2': [None] * len(rivers),
         'geometry': [None] * len(rivers)
     }, crs='EPSG:4326')
 
 
-def get_farmland_gdf(farmland_parquet):
-    global _FARM_GDF
-    if _FARM_GDF is None:
-        _FARM_GDF = gpd.read_parquet(farmland_parquet)
-    return _FARM_GDF
+def _load_farmland(farmland_source, bbox):
+    """Read cropland polygons inside bbox.
+
+    farmland_source may be:
+      - a directory containing tiled cropland parquets (Global_Run case);
+        only tiles overlapping bbox are read.
+      - a single pre-merged parquet (legacy case).
+    """
+    folder, fallback_path = resolve_source(farmland_source, '*.parquet')
+    if folder is not None:
+        return read_tiles_in_bbox(folder, '*.parquet', bbox=tuple(bbox))
+    return gpd.read_parquet(fallback_path, bbox=tuple(bbox))
 
 
-def calculate_basin_farmland(basin_file, rivers, farmland_parquet):
-    basins = gpd.read_parquet(basin_file, filters=[('linkno', 'in', rivers)])
+def calculate_basin_farmland(basin_file, rivers, farmland_source):
+    basins = gpd.read_parquet(basin_file, filters=[('LINKNO', 'in', rivers)])
 
     if len(basins) == 0:
         return _empty_result(rivers)
 
-    # Get cached farmland data
-    farm_gdf = get_farmland_gdf(farmland_parquet)
+    # Bbox-filtered farmland load. For tile folders this skips non-overlapping
+    # ESA tiles entirely (footer check) and uses row-group bbox pushdown on
+    # the rest.
+    farm_gdf = _load_farmland(farmland_source, basins.total_bounds)
 
     if len(farm_gdf) == 0 or 'geometry' not in farm_gdf.columns:
         return _empty_result(rivers)
@@ -63,22 +73,21 @@ def calculate_basin_farmland(basin_file, rivers, farmland_parquet):
     if len(intersections) == 0:
         return _empty_result(rivers)
 
-    # Calculate area in m^2 (CEA projection units). Single source of truth -
-    # convert to other units at the output layer if needed.
+    # Calculate area in m^2 (CEA projection units).
     intersections['area_m2'] = intersections.geometry.area
 
     # Reproject polygons back to WGS84 for visualization
     intersections_wgs84 = intersections.to_crs('EPSG:4326')
 
     # Select final columns (keep geometry as polygons)
-    result = intersections_wgs84[['linkno', 'area_m2', 'geometry']].copy()
+    result = intersections_wgs84[['LINKNO', 'area_m2', 'geometry']].copy()
 
-    # Add missing linknos (basins with no farmland)
-    missing_linknos = set(rivers) - set(result['linkno'])
+    # Add missing LINKNOs (basins with no farmland)
+    missing_linknos = set(rivers) - set(result['LINKNO'])
 
     if missing_linknos:
         missing_gdf = gpd.GeoDataFrame({
-            'linkno': list(missing_linknos),
+            'LINKNO': list(missing_linknos),
             'area_m2': [None] * len(missing_linknos),
             'geometry': [None] * len(missing_linknos)
         }, crs='EPSG:4326')
@@ -93,13 +102,13 @@ def calculate_basin_farmland_wrapper(args):
 
 def aggregate_farmland_for_csv(farmland_result):
     """Collapse the per-intersection farmland_result into one row per basin
-    for CSV export. Output has exactly two columns: linkno and area_m2.
+    for CSV export. Output has exactly two columns: LINKNO and area_m2.
     A TOTAL row is prepended. Basins with no farmland keep a NaN area row
     (min_count=1 prevents the sum from collapsing missing data to 0)."""
     df = pd.DataFrame(farmland_result.drop(columns='geometry', errors='ignore'))
 
-    per_basin = df.groupby('linkno', dropna=False, as_index=False)['area_m2'].sum(min_count=1)
+    per_basin = df.groupby('LINKNO', dropna=False, as_index=False)['area_m2'].sum(min_count=1)
 
     total = per_basin['area_m2'].sum(min_count=1)
-    total_row = pd.DataFrame({'linkno': ['TOTAL'], 'area_m2': [total]})
+    total_row = pd.DataFrame({'LINKNO': ['TOTAL'], 'area_m2': [total]})
     return pd.concat([total_row, per_basin], ignore_index=True)
