@@ -32,6 +32,8 @@ import math
 import os
 import time
 import warnings
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import geopandas as gpd
@@ -58,6 +60,21 @@ COMPRESSION = 'brotli'
 # per-batch overhead. Each "batch" is one pyarrow row group's worth of
 # geometries deserialized to shapely + processed.
 BATCH_SIZE  = 50000
+
+# Thread-pool knob. 1 means fully sequential (no pool). Raise to use a
+# bounded ThreadPoolExecutor over batches within a single tile.
+#
+# Threads, not processes: Shapely 2.x releases the GIL for from_wkb,
+# simplify, area and bounds, so threads get real CPU parallelism without
+# the pickling overhead a multiprocessing pool would impose on millions
+# of shapely objects.
+#
+# Memory: with N workers, peak per-tile in-flight memory scales with
+# (N+1) batches because we keep at most ~2*N futures queued at any time.
+# Bump this carefully - 2 to 4 is the usual sweet spot. ParquetWriter is
+# called from the MAIN thread only, so output integrity doesn't depend
+# on worker count.
+N_WORKERS   = 1
 
 
 # --------- streaming simplifier ---------
@@ -90,8 +107,34 @@ def _build_geo_metadata(primary_col, crs_dict, geometry_types, global_bbox):
     }
 
 
+def _process_batch_wkb(wkb_arr, crs_dict):
+    """Worker function: WKB-bytes -> simplified WKB-bytes + bounds frame.
+
+    Pure CPU work, no I/O, no global state. Returns None when no polygons
+    survive the area filter. The heavy ops (from_wkb, simplify, area,
+    bounds) release the GIL in Shapely 2.x, so this is safe to run in
+    multiple threads concurrently.
+    """
+    geoms = gpd.GeoSeries(from_wkb(wkb_arr), crs=crs_dict)
+    geoms = geoms.simplify(tolerance=TOLERANCE, preserve_topology=True)
+
+    mask = geoms.area >= MIN_AREA
+    if not mask.any():
+        return None
+    geoms = geoms[mask].reset_index(drop=True)
+    if len(geoms) == 0:
+        return None
+
+    bounds = geoms.bounds  # DataFrame with minx, miny, maxx, maxy
+    wkb_bytes = [g.wkb for g in geoms]
+    return wkb_bytes, bounds
+
+
 def simplify_tile_streaming(input_path, output_path):
     """Streamed simplify+filter for one tile.
+
+    Sequential when N_WORKERS<=1; otherwise uses a bounded ThreadPoolExecutor
+    over batches with at most ~2*N_WORKERS futures in flight.
 
     Returns (n_in, n_out, mb_in, mb_out) for reduction reporting.
     """
@@ -111,100 +154,112 @@ def simplify_tile_streaming(input_path, output_path):
     geometry_types = ['Polygon', 'MultiPolygon']
 
     n_in  = pf.metadata.num_rows
-    n_out = 0
+    n_out_counter = [0]  # boxed so the nested writer fn can mutate
 
     # Global bbox accumulator (in input CRS units).
-    gxmin = gymin =  math.inf
-    gxmax = gymax = -math.inf
+    gx = [math.inf, math.inf, -math.inf, -math.inf]  # [xmin, ymin, xmax, ymax]
 
-    writer = None
+    writer = [None]  # boxed for nested function
+
     # Total batches for the inner progress bar (last batch may be partial).
     n_batches_expected = max(1, math.ceil(n_in / BATCH_SIZE))
+
+    def _write_result(result):
+        """Called from main thread only. Writes one processed batch to the
+        output parquet and updates the running global bbox + count."""
+        if result is None:
+            return
+        wkb_bytes, bounds = result
+        n_out_counter[0] += len(wkb_bytes)
+
+        gx[0] = min(gx[0], bounds.minx.min())
+        gx[1] = min(gx[1], bounds.miny.min())
+        gx[2] = max(gx[2], bounds.maxx.max())
+        gx[3] = max(gx[3], bounds.maxy.max())
+
+        geom_pa = pa.array(wkb_bytes, type=pa.binary())
+        bbox_pa = pa.StructArray.from_arrays(
+            [
+                pa.array(bounds.minx.values, type=pa.float64()),
+                pa.array(bounds.miny.values, type=pa.float64()),
+                pa.array(bounds.maxx.values, type=pa.float64()),
+                pa.array(bounds.maxy.values, type=pa.float64()),
+            ],
+            names=['xmin', 'ymin', 'xmax', 'ymax'],
+        )
+        chunk_table = pa.table({primary_col: geom_pa, 'bbox': bbox_pa})
+        if writer[0] is None:
+            writer[0] = pq.ParquetWriter(
+                output_path, chunk_table.schema, compression=COMPRESSION
+            )
+        writer[0].write_table(chunk_table)
+
     try:
         # Read only the geometry column. The cropland tiles are
-        # geometry-only, so this is also "all" of the data; if you ever
-        # point this at a tile with attribute columns, the attributes
-        # will be dropped - the simplified output is geometry only.
+        # geometry-only; if you ever point this at a tile with attribute
+        # columns, the attributes will be dropped - simplified output is
+        # geometry only.
         batch_iter = pf.iter_batches(batch_size=BATCH_SIZE, columns=[primary_col])
-        for batch in tqdm(
-            batch_iter,
-            total=n_batches_expected,
-            desc=f"  {os.path.basename(input_path):<28}",
-            unit="batch",
-            leave=False,
-        ):
-            wkb_arr = batch.column(primary_col).to_pylist()
-            if not wkb_arr:
-                continue
+        desc = f"  {os.path.basename(input_path):<28}"
 
-            # WKB -> shapely -> GeoSeries (so we get vectorized simplify/area).
-            geoms = gpd.GeoSeries(from_wkb(wkb_arr), crs=crs_dict)
+        if N_WORKERS <= 1:
+            # ---- Sequential path ----
+            for batch in tqdm(batch_iter, total=n_batches_expected,
+                              desc=desc, unit="batch", leave=False):
+                wkb_arr = batch.column(primary_col).to_pylist()
+                if not wkb_arr:
+                    continue
+                _write_result(_process_batch_wkb(wkb_arr, crs_dict))
+        else:
+            # ---- Threaded path: bounded queue, FIFO submit, finish-as-completed ----
+            # At most max_in_flight futures alive at once; the I/O-bound main
+            # thread does the writes, workers do the CPU work in parallel.
+            max_in_flight = N_WORKERS * 2
+            in_flight = set()
+            pbar = tqdm(total=n_batches_expected, desc=desc,
+                        unit="batch", leave=False)
+            with ThreadPoolExecutor(max_workers=N_WORKERS) as pool:
+                exhausted = False
+                while True:
+                    # Top up the queue
+                    while not exhausted and len(in_flight) < max_in_flight:
+                        try:
+                            batch = next(batch_iter)
+                        except StopIteration:
+                            exhausted = True
+                            break
+                        wkb_arr = batch.column(primary_col).to_pylist()
+                        if not wkb_arr:
+                            continue
+                        in_flight.add(pool.submit(_process_batch_wkb, wkb_arr, crs_dict))
 
-            # Simplify. preserve_topology stops thin polygons from collapsing.
-            geoms = geoms.simplify(tolerance=TOLERANCE, preserve_topology=True)
+                    if not in_flight:
+                        break
 
-            # Area filter AFTER simplify (simplify can shrink polygons
-            # slightly, so doing it after catches a few more sub-threshold
-            # cases than doing it before).
-            mask = geoms.area >= MIN_AREA
-            if not mask.any():
-                continue
-            geoms = geoms[mask].reset_index(drop=True)
-            if len(geoms) == 0:
-                continue
-
-            # Per-row bounds for the output bbox column + global bbox update.
-            bounds = geoms.bounds  # DataFrame with minx, miny, maxx, maxy
-            gxmin = min(gxmin, bounds.minx.min())
-            gymin = min(gymin, bounds.miny.min())
-            gxmax = max(gxmax, bounds.maxx.max())
-            gymax = max(gymax, bounds.maxy.max())
-
-            # Build a pyarrow Table with two columns:
-            #   primary_col  : binary  (WKB)
-            #   'bbox'       : struct of four float64 (xmin, ymin, xmax, ymax)
-            wkb_bytes = [g.wkb for g in geoms]
-            geom_pa = pa.array(wkb_bytes, type=pa.binary())
-            bbox_pa = pa.StructArray.from_arrays(
-                [
-                    pa.array(bounds.minx.values, type=pa.float64()),
-                    pa.array(bounds.miny.values, type=pa.float64()),
-                    pa.array(bounds.maxx.values, type=pa.float64()),
-                    pa.array(bounds.maxy.values, type=pa.float64()),
-                ],
-                names=['xmin', 'ymin', 'xmax', 'ymax'],
-            )
-            chunk_table = pa.table({primary_col: geom_pa, 'bbox': bbox_pa})
-
-            # Lazily open the writer on the first non-empty chunk so we
-            # can pick up the schema from the actual data.
-            if writer is None:
-                writer = pq.ParquetWriter(
-                    output_path,
-                    chunk_table.schema,
-                    compression=COMPRESSION,
-                )
-
-            writer.write_table(chunk_table)
-            n_out += len(geoms)
+                    # Wait for at least one to complete, then write all that did.
+                    done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        _write_result(fut.result())
+                        pbar.update(1)
+            pbar.close()
     except Exception:
-        if writer is not None:
-            try: writer.close()
+        if writer[0] is not None:
+            try: writer[0].close()
             except Exception: pass
         raise
 
-    if writer is not None:
+    if writer[0] is not None:
         # Attach the GeoParquet 1.1 'geo' metadata. The global bbox we
         # collected lets downstream code do whole-file skip checks; the
         # covering.bbox pointer lets pyarrow do row-group pushdown.
-        global_bbox = (gxmin, gymin, gxmax, gymax)
+        global_bbox = tuple(gx)
         geo_md = _build_geo_metadata(primary_col, crs_dict, geometry_types, global_bbox)
-        writer.add_key_value_metadata({'geo': json.dumps(geo_md)})
-        writer.close()
+        writer[0].add_key_value_metadata({'geo': json.dumps(geo_md)})
+        writer[0].close()
 
     mb_in  = os.path.getsize(input_path)  / (1024 * 1024)
     mb_out = os.path.getsize(output_path) / (1024 * 1024) if os.path.exists(output_path) else 0.0
-    return n_in, n_out, mb_in, mb_out
+    return n_in, n_out_counter[0], mb_in, mb_out
 
 
 # --------- driver ---------
