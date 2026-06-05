@@ -38,6 +38,7 @@ import geopandas as gpd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from shapely import from_wkb
+from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
 
@@ -117,12 +118,21 @@ def simplify_tile_streaming(input_path, output_path):
     gxmax = gymax = -math.inf
 
     writer = None
+    # Total batches for the inner progress bar (last batch may be partial).
+    n_batches_expected = max(1, math.ceil(n_in / BATCH_SIZE))
     try:
         # Read only the geometry column. The cropland tiles are
         # geometry-only, so this is also "all" of the data; if you ever
         # point this at a tile with attribute columns, the attributes
         # will be dropped - the simplified output is geometry only.
-        for batch in pf.iter_batches(batch_size=BATCH_SIZE, columns=[primary_col]):
+        batch_iter = pf.iter_batches(batch_size=BATCH_SIZE, columns=[primary_col])
+        for batch in tqdm(
+            batch_iter,
+            total=n_batches_expected,
+            desc=f"  {os.path.basename(input_path):<28}",
+            unit="batch",
+            leave=False,
+        ):
             wkb_arr = batch.column(primary_col).to_pylist()
             if not wkb_arr:
                 continue
@@ -224,21 +234,24 @@ def main():
     total_in_mb = total_out_mb = 0.0
     n_processed = n_skipped = n_failed = 0
 
-    for i, input_path in enumerate(tiles, 1):
+    # Outer bar: ticks once per tile, description shows current filename.
+    outer = tqdm(tiles, desc="Tiles", unit="tile")
+    for i, input_path in enumerate(outer, 1):
         name = os.path.basename(input_path)
+        outer.set_postfix_str(name)
         output_path = str(out_folder / name)
 
         if os.path.exists(output_path):
-            print(f"  [{i:>2}/{len(tiles)}] {name} -- already exists, skipping")
+            tqdm.write(f"  [{i:>2}/{len(tiles)}] {name} -- already exists, skipping")
             n_skipped += 1
             continue
 
-        print(f"  [{i:>2}/{len(tiles)}] {name} -- processing...")
+        tqdm.write(f"  [{i:>2}/{len(tiles)}] {name} -- processing...")
         t0 = time.time()
         try:
             n_in, n_out, mb_in, mb_out = simplify_tile_streaming(input_path, output_path)
         except Exception as e:
-            print(f"      FAILED: {e}")
+            tqdm.write(f"      FAILED: {e}")
             try: os.remove(output_path)
             except OSError: pass
             n_failed += 1
@@ -247,7 +260,7 @@ def main():
         elapsed = time.time() - t0
         poly_drop = 100.0 * (1 - n_out / max(n_in, 1))
         size_drop = 100.0 * (1 - mb_out / max(mb_in, 1e-9))
-        print(
+        tqdm.write(
             f"      {n_in:>10,} -> {n_out:>10,} polys ({poly_drop:5.1f}% dropped) | "
             f"{mb_in:7.1f} MB -> {mb_out:7.1f} MB ({size_drop:5.1f}% smaller) | "
             f"{elapsed:.1f}s"
@@ -257,6 +270,7 @@ def main():
         total_in_mb     += mb_in
         total_out_mb    += mb_out
         n_processed     += 1
+    outer.close()
 
     elapsed = time.time() - overall_start
     print("=" * 78)
