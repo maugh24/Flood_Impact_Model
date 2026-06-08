@@ -1,38 +1,42 @@
 """
 Simplify_Cropland.py
 
-Preprocessing pass that walks every ESA cropland tile in INPUT_FOLDER,
-simplifies polygon geometries and drops tiny noise polygons, then writes
-each tile to OUTPUT_FOLDER with brotli compression and a per-row covering
-bbox column.
+Convert ONE large cropland parquet into a simplified, area-filtered
+EPSG:4326 parquet with a per-row covering bbox so downstream readers
+(QGIS, geopandas, tile_loader.read_tiles_in_bbox) can do row-group
+pushdown on bbox filters.
 
-ROW-GROUP STREAMING
--------------------
-Each tile is processed one row group at a time:
-  - Read a single row group of WKB geometry via pyarrow.iter_batches.
-  - Deserialize WKB -> shapely, simplify, area-filter.
-  - Serialize the survivors back to WKB and write them straight out as
-    a new row group in the output parquet via ParquetWriter.
-  - Track the running global covering bbox as we go.
-  - On close, attach the GeoParquet 1.1 file metadata, including the
-    global covering bbox and the per-row bbox-column pointer.
+Per-batch streamed pipeline:
+  1. Read a row group's WKB geometries in the source CRS
+     (ESA cropland tiles are stored in an equal-area meter projection
+     like ESRI:54034).
+  2. Simplify with TOLERANCE in source-CRS units (meters).
+  3. Drop polygons whose area is below MIN_AREA m^2.
+  4. Reproject survivors to EPSG:4326.
+  5. Append to the output parquet as a row group, carrying a per-row
+     bbox column for the covering metadata.
 
-Peak memory per process is bounded by ONE row group's worth of geometry
-(controlled by BATCH_SIZE), not the whole tile. The simplified output
-is written incrementally so it never sits all in memory at once either.
+Why simplify + filter BEFORE reprojecting:
+  - The source is an equal-area projection - area in m^2 is physically
+    meaningful and constant across the tile.
+  - EPSG:4326 is degrees - area in 4326 has no physical meaning and
+    varies with latitude by orders of magnitude. Filtering by "area
+    >= 500" in 4326 would mean very different things at the equator
+    vs near the poles.
+  - Simplify tolerance has the same issue: 10 m in a CEA projection
+    means 10 m everywhere; ~0.0001 degrees in 4326 means different
+    ground distances at different latitudes.
 
-Other behavior matches the previous version:
-  - Tile-at-a-time across the folder, no inner parallelism.
-  - Tiles whose output already exists are skipped (resumable).
-  - Failed tiles have their partial output cleaned up.
+Memory:
+  - Peak is bounded by BATCH_SIZE rows in flight (sequential) or
+    BATCH_SIZE * 2 * N_WORKERS (threaded).
+  - Threading uses Shapely 2.x GIL-releasing ops, so no pickling tax.
 """
-import glob
 import json
 import math
 import os
 import time
 import warnings
-from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
@@ -45,39 +49,30 @@ from tqdm import tqdm
 warnings.filterwarnings('ignore')
 
 
-# ---- Paths ----
-INPUT_FOLDER  = r"D:\Brian\Flood_Impact_Model\Files\ESA\Parquet"
-OUTPUT_FOLDER = r"D:\Brian\Flood_Impact_Model\Files\ESA\Parquet\bbox"
+# ---- Paths (single file, single file out) ----
+INPUT_PATH  = r"D:\Brian\Flood_Impact_Model\Files\ESA\Parquet\n30e000cropland.parquet"
+OUTPUT_PATH = r"D:\Brian\Flood_Impact_Model\Files\ESA\Parquet\bbox\n30e000cropland_bbox.parquet"
 
-# ---- Simplification parameters (CEA meters - cropland tiles were saved
-# in cylindrical equal-area by cropland_raster_to_parquet.py) ----
+# ---- Simplification parameters ----
+# Both thresholds are interpreted in the SOURCE CRS (the cropland tiles'
+# native equal-area meter projection). Iterative values - tune as needed.
 TOLERANCE   = 10       # max distance (m) a vertex may move during simplification
 MIN_AREA    = 500      # drop polygons smaller than this (m^2)
+
+# ---- Output ----
+OUTPUT_CRS  = 'EPSG:4326'
 COMPRESSION = 'brotli'
 
-# Row-group streaming knob. Lower this if you're still hitting memory
-# pressure; raise it if you have RAM to spare and want to amortize the
-# per-batch overhead. Each "batch" is one pyarrow row group's worth of
-# geometries deserialized to shapely + processed.
+# ---- Streaming / concurrency ----
+# Each "batch" is BATCH_SIZE rows from the input read via pyarrow.
+# Lower BATCH_SIZE for less peak memory per batch.
 BATCH_SIZE  = 50000
-
-# Thread-pool knob. 1 means fully sequential (no pool). Raise to use a
-# bounded ThreadPoolExecutor over batches within a single tile.
-#
-# Threads, not processes: Shapely 2.x releases the GIL for from_wkb,
-# simplify, area and bounds, so threads get real CPU parallelism without
-# the pickling overhead a multiprocessing pool would impose on millions
-# of shapely objects.
-#
-# Memory: with N workers, peak per-tile in-flight memory scales with
-# (N+1) batches because we keep at most ~2*N futures queued at any time.
-# Bump this carefully - 2 to 4 is the usual sweet spot. ParquetWriter is
-# called from the MAIN thread only, so output integrity doesn't depend
-# on worker count.
-N_WORKERS   = 1
+# 1 = fully sequential. Raise to use a bounded ThreadPoolExecutor over
+# batches. Memory peak scales with N_WORKERS - keep it conservative.
+N_WORKERS   = 18
 
 
-# --------- streaming simplifier ---------
+# --------- GeoParquet metadata helper ---------
 
 def _build_geo_metadata(primary_col, crs_dict, geometry_types, global_bbox):
     """Build a GeoParquet 1.1 'geo' file-metadata block.
@@ -107,17 +102,23 @@ def _build_geo_metadata(primary_col, crs_dict, geometry_types, global_bbox):
     }
 
 
-def _process_batch_wkb(wkb_arr, crs_dict):
-    """Worker function: WKB-bytes -> simplified WKB-bytes + bounds frame.
+# --------- per-batch worker ---------
 
-    Pure CPU work, no I/O, no global state. Returns None when no polygons
-    survive the area filter. The heavy ops (from_wkb, simplify, area,
-    bounds) release the GIL in Shapely 2.x, so this is safe to run in
-    multiple threads concurrently.
+def _process_batch(wkb_arr, src_crs, dst_crs):
+    """Pure CPU work, no I/O, no shared state.
+
+    Deserialize WKB -> simplify (in source CRS) -> area filter (m^2 in
+    source CRS) -> reproject to dst_crs -> serialize back to WKB +
+    return per-row bounds (in dst_crs units, i.e. degrees for 4326).
+
+    Returns (wkb_bytes_list, bounds_df) or None if nothing survives.
+    The heavy ops (from_wkb, simplify, area, to_crs, bounds) release the
+    GIL in Shapely 2.x, so this is safe to run in multiple threads.
     """
-    geoms = gpd.GeoSeries(from_wkb(wkb_arr), crs=crs_dict)
+    geoms = gpd.GeoSeries(from_wkb(wkb_arr), crs=src_crs)
     geoms = geoms.simplify(tolerance=TOLERANCE, preserve_topology=True)
 
+    # Area filter in source CRS (equal-area meters).
     mask = geoms.area >= MIN_AREA
     if not mask.any():
         return None
@@ -125,48 +126,54 @@ def _process_batch_wkb(wkb_arr, crs_dict):
     if len(geoms) == 0:
         return None
 
-    bounds = geoms.bounds  # DataFrame with minx, miny, maxx, maxy
+    # Reproject to the output CRS. Per-row bounds for the covering bbox
+    # column are computed AFTER reprojection so the bbox column units
+    # match the output CRS (degrees for 4326).
+    geoms = geoms.to_crs(dst_crs)
+    bounds = geoms.bounds
     wkb_bytes = [g.wkb for g in geoms]
     return wkb_bytes, bounds
 
 
-def simplify_tile_streaming(input_path, output_path):
-    """Streamed simplify+filter for one tile.
+# --------- streamed driver ---------
 
-    Sequential when N_WORKERS<=1; otherwise uses a bounded ThreadPoolExecutor
-    over batches with at most ~2*N_WORKERS futures in flight.
+def simplify_tile(input_path, output_path):
+    """Stream-convert one cropland tile.
 
     Returns (n_in, n_out, mb_in, mb_out) for reduction reporting.
     """
     pf = pq.ParquetFile(input_path)
 
-    # Pull GeoParquet metadata from the INPUT so we can preserve CRS and
-    # discover the primary geometry column name.
+    # Recover the source CRS from the input GeoParquet metadata so we
+    # don't have to hard-code ESRI:54034 here. Different tiles could in
+    # principle live in different CRSes - this stays correct.
     file_kv = pf.metadata.metadata or {}
     if b'geo' not in file_kv:
         raise ValueError(f"{input_path}: input lacks GeoParquet metadata")
     in_geo = json.loads(file_kv[b'geo'])
     primary_col   = in_geo.get('primary_column', 'geometry')
-    in_col_meta   = in_geo['columns'][primary_col]
-    crs_dict      = in_col_meta.get('crs')
-    # Be liberal about what we declare we may emit: simplify can introduce
-    # MultiPolygons from polygons that become disconnected.
-    geometry_types = ['Polygon', 'MultiPolygon']
+    src_crs_dict  = in_geo['columns'][primary_col].get('crs')
+
+    # Output declares both Polygon and MultiPolygon because simplify can
+    # disconnect thin polygons into multipart geometries.
+    out_geometry_types = ['Polygon', 'MultiPolygon']
+
+    # Build the output CRS dict as JSON-serializable PROJJSON for the
+    # GeoParquet metadata block. CRS.from_user_input(OUTPUT_CRS) handles
+    # 'EPSG:4326' / dict / WKT uniformly.
+    from pyproj import CRS as _CRS
+    out_crs_dict = json.loads(_CRS.from_user_input(OUTPUT_CRS).to_json())
 
     n_in  = pf.metadata.num_rows
-    n_out_counter = [0]  # boxed so the nested writer fn can mutate
+    n_out_counter = [0]                          # boxed for nested fn
+    gx = [math.inf, math.inf, -math.inf, -math.inf]  # global bbox accum
+    writer = [None]                              # boxed for nested fn
 
-    # Global bbox accumulator (in input CRS units).
-    gx = [math.inf, math.inf, -math.inf, -math.inf]  # [xmin, ymin, xmax, ymax]
-
-    writer = [None]  # boxed for nested function
-
-    # Total batches for the inner progress bar (last batch may be partial).
     n_batches_expected = max(1, math.ceil(n_in / BATCH_SIZE))
 
     def _write_result(result):
-        """Called from main thread only. Writes one processed batch to the
-        output parquet and updates the running global bbox + count."""
+        """Main-thread-only. Append one processed batch as a row group
+        and update the running global bbox + count."""
         if result is None:
             return
         wkb_bytes, bounds = result
@@ -188,6 +195,7 @@ def simplify_tile_streaming(input_path, output_path):
             names=['xmin', 'ymin', 'xmax', 'ymax'],
         )
         chunk_table = pa.table({primary_col: geom_pa, 'bbox': bbox_pa})
+
         if writer[0] is None:
             writer[0] = pq.ParquetWriter(
                 output_path, chunk_table.schema, compression=COMPRESSION
@@ -195,33 +203,25 @@ def simplify_tile_streaming(input_path, output_path):
         writer[0].write_table(chunk_table)
 
     try:
-        # Read only the geometry column. The cropland tiles are
-        # geometry-only; if you ever point this at a tile with attribute
-        # columns, the attributes will be dropped - simplified output is
-        # geometry only.
         batch_iter = pf.iter_batches(batch_size=BATCH_SIZE, columns=[primary_col])
         desc = f"  {os.path.basename(input_path):<28}"
 
         if N_WORKERS <= 1:
-            # ---- Sequential path ----
+            # ---- Sequential ----
             for batch in tqdm(batch_iter, total=n_batches_expected,
-                              desc=desc, unit="batch", leave=False):
+                              desc=desc, unit="batch"):
                 wkb_arr = batch.column(primary_col).to_pylist()
                 if not wkb_arr:
                     continue
-                _write_result(_process_batch_wkb(wkb_arr, crs_dict))
+                _write_result(_process_batch(wkb_arr, src_crs_dict, OUTPUT_CRS))
         else:
-            # ---- Threaded path: bounded queue, FIFO submit, finish-as-completed ----
-            # At most max_in_flight futures alive at once; the I/O-bound main
-            # thread does the writes, workers do the CPU work in parallel.
+            # ---- Bounded thread pool ----
             max_in_flight = N_WORKERS * 2
             in_flight = set()
-            pbar = tqdm(total=n_batches_expected, desc=desc,
-                        unit="batch", leave=False)
+            pbar = tqdm(total=n_batches_expected, desc=desc, unit="batch")
             with ThreadPoolExecutor(max_workers=N_WORKERS) as pool:
                 exhausted = False
                 while True:
-                    # Top up the queue
                     while not exhausted and len(in_flight) < max_in_flight:
                         try:
                             batch = next(batch_iter)
@@ -231,12 +231,11 @@ def simplify_tile_streaming(input_path, output_path):
                         wkb_arr = batch.column(primary_col).to_pylist()
                         if not wkb_arr:
                             continue
-                        in_flight.add(pool.submit(_process_batch_wkb, wkb_arr, crs_dict))
-
+                        in_flight.add(
+                            pool.submit(_process_batch, wkb_arr, src_crs_dict, OUTPUT_CRS)
+                        )
                     if not in_flight:
                         break
-
-                    # Wait for at least one to complete, then write all that did.
                     done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
                     for fut in done:
                         _write_result(fut.result())
@@ -249,11 +248,11 @@ def simplify_tile_streaming(input_path, output_path):
         raise
 
     if writer[0] is not None:
-        # Attach the GeoParquet 1.1 'geo' metadata. The global bbox we
-        # collected lets downstream code do whole-file skip checks; the
-        # covering.bbox pointer lets pyarrow do row-group pushdown.
-        global_bbox = tuple(gx)
-        geo_md = _build_geo_metadata(primary_col, crs_dict, geometry_types, global_bbox)
+        # Attach GeoParquet metadata with OUTPUT CRS (EPSG:4326) and the
+        # global bbox we accumulated in 4326 degrees.
+        geo_md = _build_geo_metadata(
+            primary_col, out_crs_dict, out_geometry_types, tuple(gx)
+        )
         writer[0].add_key_value_metadata({'geo': json.dumps(geo_md)})
         writer[0].close()
 
@@ -262,83 +261,45 @@ def simplify_tile_streaming(input_path, output_path):
     return n_in, n_out_counter[0], mb_in, mb_out
 
 
-# --------- driver ---------
+# --------- main ---------
 
 def main():
-    in_folder  = Path(INPUT_FOLDER)
-    out_folder = Path(OUTPUT_FOLDER)
-    out_folder.mkdir(parents=True, exist_ok=True)
+    in_path  = Path(INPUT_PATH)
+    out_path = Path(OUTPUT_PATH)
 
-    # Only top-level *.parquet, NOT recursive - don't pick up files we
-    # already wrote into bbox/.
-    tiles = sorted(glob.glob(str(in_folder / '*.parquet')))
-    tiles = [t for t in tiles if Path(t).parent.resolve() != out_folder.resolve()]
-
-    if not tiles:
-        print(f"No .parquet tiles found in {in_folder}")
+    if not in_path.exists():
+        print(f"Input not found: {in_path}")
         return
 
-    print(f"Found {len(tiles)} cropland tiles in {in_folder}")
-    print(f"Writing simplified output to {out_folder}")
-    print(f"Tolerance: {TOLERANCE} m   Min area: {MIN_AREA} m^2   "
-          f"Compression: {COMPRESSION}   Batch size: {BATCH_SIZE:,} rows")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"Input:       {in_path}")
+    print(f"Output:      {out_path}")
+    print(f"Tolerance:   {TOLERANCE} m (source CRS)   "
+          f"Min area: {MIN_AREA} m^2 (source CRS)")
+    print(f"Output CRS:  {OUTPUT_CRS}   "
+          f"Compression: {COMPRESSION}   "
+          f"Batch: {BATCH_SIZE:,} rows   Workers: {N_WORKERS}")
     print("=" * 78)
 
-    overall_start = time.time()
-    total_in_polys = total_out_polys = 0
-    total_in_mb = total_out_mb = 0.0
-    n_processed = n_skipped = n_failed = 0
+    t0 = time.time()
+    try:
+        n_in, n_out, mb_in, mb_out = simplify_tile(str(in_path), str(out_path))
+    except Exception as e:
+        print(f"FAILED: {e}")
+        try: os.remove(out_path)
+        except OSError: pass
+        return
 
-    # Outer bar: ticks once per tile, description shows current filename.
-    outer = tqdm(tiles, desc="Tiles", unit="tile")
-    for i, input_path in enumerate(outer, 1):
-        name = os.path.basename(input_path)
-        outer.set_postfix_str(name)
-        output_path = str(out_folder / name)
-
-        if os.path.exists(output_path):
-            tqdm.write(f"  [{i:>2}/{len(tiles)}] {name} -- already exists, skipping")
-            n_skipped += 1
-            continue
-
-        tqdm.write(f"  [{i:>2}/{len(tiles)}] {name} -- processing...")
-        t0 = time.time()
-        try:
-            n_in, n_out, mb_in, mb_out = simplify_tile_streaming(input_path, output_path)
-        except Exception as e:
-            tqdm.write(f"      FAILED: {e}")
-            try: os.remove(output_path)
-            except OSError: pass
-            n_failed += 1
-            continue
-
-        elapsed = time.time() - t0
-        poly_drop = 100.0 * (1 - n_out / max(n_in, 1))
-        size_drop = 100.0 * (1 - mb_out / max(mb_in, 1e-9))
-        tqdm.write(
-            f"      {n_in:>10,} -> {n_out:>10,} polys ({poly_drop:5.1f}% dropped) | "
-            f"{mb_in:7.1f} MB -> {mb_out:7.1f} MB ({size_drop:5.1f}% smaller) | "
-            f"{elapsed:.1f}s"
-        )
-        total_in_polys  += n_in
-        total_out_polys += n_out
-        total_in_mb     += mb_in
-        total_out_mb    += mb_out
-        n_processed     += 1
-    outer.close()
-
-    elapsed = time.time() - overall_start
+    elapsed = time.time() - t0
+    poly_drop = 100.0 * (1 - n_out / max(n_in, 1))
+    size_drop = 100.0 * (1 - mb_out / max(mb_in, 1e-9))
     print("=" * 78)
-    print(f"Processed: {n_processed}   Skipped (already done): {n_skipped}   Failed: {n_failed}")
-    if n_processed:
-        poly_drop = 100.0 * (1 - total_out_polys / max(total_in_polys, 1))
-        size_drop = 100.0 * (1 - total_out_mb / max(total_in_mb, 1e-9))
-        print(
-            f"Newly-written tiles: "
-            f"{total_in_polys:,} -> {total_out_polys:,} polys ({poly_drop:.1f}% reduction) | "
-            f"{total_in_mb:.0f} MB -> {total_out_mb:.0f} MB ({size_drop:.1f}% reduction)"
-        )
-    print(f"Total elapsed: {elapsed:.1f}s")
+    print(
+        f"{n_in:,} -> {n_out:,} polys ({poly_drop:.1f}% dropped) | "
+        f"{mb_in:.1f} MB -> {mb_out:.1f} MB ({size_drop:.1f}% smaller) | "
+        f"{elapsed:.1f}s"
+    )
 
 
 if __name__ == "__main__":
