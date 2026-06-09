@@ -124,26 +124,26 @@ def run_single_job(area_label: str, rp_label: str, flood_file: str,
     t0 = time.time()
 
     # ----- Population --------------------------------------------------------
-    print(f"{tag} Population...")
-    pop_result = calculate_flood_population(flood_file, config["population_parquet"])
-    if len(pop_result) > 0:
-        pop_gdf = gpd.GeoDataFrame(
-            pop_result,
-            geometry=gpd.points_from_xy(pop_result["x"], pop_result["y"]),
-            crs="EPSG:4326",
-        )
-    else:
-        pop_gdf = gpd.GeoDataFrame(pop_result, geometry=gpd.GeoSeries([], crs="EPSG:4326"))
-    pop_gdf.to_parquet(out_dir / "population_statistics.parquet", index=False)
-    aggregate_population_for_csv(pop_result).to_csv(out_dir / "population_statistics.csv", index=False)
-    _to_geojson(pop_gdf, out_dir / "population_statistics.geojson", rp_label)
+    #print(f"{tag} Population...")
+    #pop_result = calculate_flood_population(flood_file, config["population_parquet"])
+    #if len(pop_result) > 0:
+    #    pop_gdf = gpd.GeoDataFrame(
+    #        pop_result,
+    #        geometry=gpd.points_from_xy(pop_result["x"], pop_result["y"]),
+    #        crs="EPSG:4326",
+    #    )
+    #else:
+    #    pop_gdf = gpd.GeoDataFrame(pop_result, geometry=gpd.GeoSeries([], crs="EPSG:4326"))
+    #pop_gdf.to_parquet(out_dir / "population_statistics.parquet", index=False)
+    #aggregate_population_for_csv(pop_result).to_csv(out_dir / "population_statistics.csv", index=False)
+    #_to_geojson(pop_gdf, out_dir / "population_statistics.geojson", rp_label)
 
     # ----- Farmland ----------------------------------------------------------
-    print(f"{tag} Farmland...")
-    farm_result = calculate_flood_farmland(flood_file, config["farmland_parquet"])
-    farm_result.to_parquet(out_dir / "farmland_statistics.parquet", index=False)
-    aggregate_farmland_for_csv(farm_result).to_csv(out_dir / "farmland_statistics.csv", index=False)
-    _to_geojson(farm_result, out_dir / "farmland_statistics.geojson", rp_label)
+    #print(f"{tag} Farmland...")
+    #farm_result = calculate_flood_farmland(flood_file, config["farmland_parquet"])
+    #farm_result.to_parquet(out_dir / "farmland_statistics.parquet", index=False)
+    #aggregate_farmland_for_csv(farm_result).to_csv(out_dir / "farmland_statistics.csv", index=False)
+    #_to_geojson(farm_result, out_dir / "farmland_statistics.geojson", rp_label)
 
     # ----- Buildings ---------------------------------------------------------
     print(f"{tag} Buildings...")
@@ -163,15 +163,15 @@ def run_single_job(area_label: str, rp_label: str, flood_file: str,
     _to_geojson(building_gdf, out_dir / "building_statistics.geojson", rp_label)
 
     # ----- Transportation ----------------------------------------------------
-    print(f"{tag} Transportation...")
-    trans_result = calculate_flood_transportation(flood_file, config["transportation_parquet"])
-    trans_result.to_parquet(out_dir / "transportation_statistics.parquet", index=False)
-    aggregate_transportation_for_csv(trans_result).to_csv(out_dir / "transportation_statistics.csv", index=False)
-    _to_geojson(trans_result, out_dir / "transportation_statistics.geojson", rp_label)
-
-    elapsed = time.time() - t0
-    print(f"{tag} Done in {elapsed:.1f}s")
-    return area_label, rp_label, elapsed
+    #print(f"{tag} Transportation...")
+    #trans_result = calculate_flood_transportation(flood_file, config["transportation_parquet"])
+    #trans_result.to_parquet(out_dir / "transportation_statistics.parquet", index=False)
+    #aggregate_transportation_for_csv(trans_result).to_csv(out_dir / "transportation_statistics.csv", index=False)
+    #_to_geojson(trans_result, out_dir / "transportation_statistics.geojson", rp_label)
+#
+    #elapsed = time.time() - t0
+    #print(f"{tag} Done in {elapsed:.1f}s")
+    #return area_label, rp_label, elapsed
 
 
 # ---------------------------------------------------------------------------
@@ -190,42 +190,42 @@ if __name__ == "__main__":
     # Add or remove areas and return periods freely — the pipeline adapts.
     AREAS = {
         "Chian_Rai": {
-            "2yr":   r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Chian_Rai\flood_2yr.parquet",
-            "5yr":   r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Chian_Rai\flood_5yr.parquet",
-            "10yr":  r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Chian_Rai\flood_10yr.parquet",
-            "25yr":  r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Chian_Rai\flood_25yr.parquet",
-            "50yr":  r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Chian_Rai\flood_50yr.parquet",
-            "100yr": r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Chian_Rai\flood_100yr.parquet",
+            #"2yr":   r"D:\Brian\Flood_Impact_Model\Files\Catchment\Chian_Rai\GEOGLOWS_dem_99.70939_19.79092_99.97134_19.99271_ARC_Flood_rp2extent.parquet",
+            #"5yr":   r"D:\Brian\Flood_Impact_Model\Files\Catchment\Chian_Rai\GEOGLOWS_dem_99.70939_19.79092_99.97134_19.99271_ARC_Flood_rp5extent.parquet",
+            #"10yr":  r"D:\Brian\Flood_Impact_Model\Files\Catchment\Chian_Rai\GEOGLOWS_dem_99.70939_19.79092_99.97134_19.99271_ARC_Flood_rp10extent.parquet",
+            #"25yr":  r"D:\Brian\Flood_Impact_Model\Files\Catchment\Chian_Rai\GEOGLOWS_dem_99.70939_19.79092_99.97134_19.99271_ARC_Flood_rp25extent.parquet",
+            #"50yr":  r"D:\Brian\Flood_Impact_Model\Files\Catchment\Chian_Rai\GEOGLOWS_dem_99.70939_19.79092_99.97134_19.99271_ARC_Flood_rp50extent.parquet",
+            "100yr": r"C:\C_Drive_Brians_Stuff\Python_Projects\Napal_Floods\Chian_Rai\GEOGLOWS_dem_99.70939_19.79092_99.97134_19.99271_ARC_Flood_rp100extent.parquet",
         },
-        "Kamala": {
-            "2yr":   r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Kamala\flood_2yr.parquet",
-            "5yr":   r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Kamala\flood_5yr.parquet",
-            "10yr":  r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Kamala\flood_10yr.parquet",
-            "25yr":  r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Kamala\flood_25yr.parquet",
-            "50yr":  r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Kamala\flood_50yr.parquet",
-            "100yr": r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Kamala\flood_100yr.parquet",
-        },
-        "Karnali": {
-            "2yr":   r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Karnali\flood_2yr.parquet",
-            "5yr":   r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Karnali\flood_5yr.parquet",
-            "10yr":  r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Karnali\flood_10yr.parquet",
-            "25yr":  r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Karnali\flood_25yr.parquet",
-            "50yr":  r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Karnali\flood_50yr.parquet",
-            "100yr": r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Karnali\flood_100yr.parquet",
-        },
+#        "Kamala": {
+#            "2yr":   r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Kamala\flood_2yr.parquet",
+#            "5yr":   r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Kamala\flood_5yr.parquet",
+#            "10yr":  r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Kamala\flood_10yr.parquet",
+#            "25yr":  r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Kamala\flood_25yr.parquet",
+#            "50yr":  r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Kamala\flood_50yr.parquet",
+#            "100yr": r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Kamala\flood_100yr.parquet",
+#        },
+#        "Karnali": {
+#            "2yr":   r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Karnali\flood_2yr.parquet",
+#            "5yr":   r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Karnali\flood_5yr.parquet",
+#            "10yr":  r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Karnali\flood_10yr.parquet",
+#            "25yr":  r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Karnali\flood_25yr.parquet",
+#            "50yr":  r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Karnali\flood_50yr.parquet",
+#            "100yr": r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\Karnali\flood_100yr.parquet",
+#        },
     }
 
-    osm_buildings      = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\OSM_Parquet\central-america-QGIS-polygons_bbox.parquet"
-    osm_transportation = r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\OSM_Parquet\central-america-QGIS-lines_bbox.parquet"
+    osm_buildings      = r"C:\C_Drive_Brians_Stuff\Python_Projects\Napal_Floods\30d_buildings.parquet"
+    osm_transportation = r"D:\Brian\Flood_Impact_Model\Files\OSM\Parquet\asia-lines-bbox.parquet"
 
     CONFIG = {
-        "population_parquet":     r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\population.parquet",
-        "farmland_parquet":       r"C:\C_Drive_Brians_Stuff\Python_Projects\Files\ESA_Parquet\s30w120cropland.parquet",
+        "population_parquet":     r"D:\Brian\Flood_Impact_Model\Files\Population\population.parquet",
+        "farmland_parquet":       r"D:\Brian\Flood_Impact_Model\Files\ESA\Parquet\Chian_Rai_Farmland_bbox.parquet",
         "building_parquet":       osm_buildings,
         "transportation_parquet": osm_transportation,
     }
 
-    MASTER_OUTPUT = r"C:\C_Drive_Brians_Stuff\Python_Projects\Napal_Floods\Impact_Analysis_Results"
+    MASTER_OUTPUT = r"D:\Brian\Flood_Impact_Model\temp_impacts"
 
     # Total jobs = areas × return periods. Lower MAX_WORKERS if memory is tight.
     all_jobs      = [(a, rp, f) for a, rps in AREAS.items() for rp, f in rps.items()]
