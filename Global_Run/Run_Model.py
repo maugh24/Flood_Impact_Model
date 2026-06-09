@@ -98,23 +98,23 @@ class GlobalImpactWorkflow:
         rivers_split = [rivers[i:i+n] for i in range(0, len(rivers), n)]
 
         # ----- Population -----
-        args = [(vpu_file, rivs, self.config['population_source']) for rivs in rivers_split]
-        pop_dfs = list(tqdm.tqdm(
-            pool.imap_unordered(calculate_basin_population_wrapper, args),
-            total=len(args), desc=f"[vpu={vpu_id}] Population    "
-        ))
-        pop_result = pd.concat(pop_dfs, ignore_index=True)
-        pop_gdf = gpd.GeoDataFrame(
-            pop_result,
-            geometry=gpd.points_from_xy(pop_result['x'], pop_result['y']),
-            crs='EPSG:4326'
-        )
-        pop_gdf.to_parquet(vpu_stats_dir / "population_statistics.parquet", index=False)
-        aggregate_population_for_csv(pop_result).to_csv(
-            vpu_stats_dir / "population_statistics.csv", index=False
-        )
-
-        # ----- Farmland -----
+      #  args = [(vpu_file, rivs, self.config['population_source']) for rivs in rivers_split]
+      #  pop_dfs = list(tqdm.tqdm(
+      #      pool.imap_unordered(calculate_basin_population_wrapper, args),
+      #      total=len(args), desc=f"[vpu={vpu_id}] Population    "
+      #  ))
+      #  pop_result = pd.concat(pop_dfs, ignore_index=True)
+      #  pop_gdf = gpd.GeoDataFrame(
+      #      pop_result,
+      #      geometry=gpd.points_from_xy(pop_result['x'], pop_result['y']),
+      #      crs='EPSG:4326'
+      #  )
+      #  pop_gdf.to_parquet(vpu_stats_dir / "population_statistics.parquet", index=False)
+      #  aggregate_population_for_csv(pop_result).to_csv(
+      #      vpu_stats_dir / "population_statistics.csv", index=False
+      #  )
+#
+      #  # ----- Farmland -----
         args = [(vpu_file, rivs, self.config['farmland_source']) for rivs in rivers_split]
         farm_gdfs = list(tqdm.tqdm(
             pool.imap_unordered(calculate_basin_farmland_wrapper, args),

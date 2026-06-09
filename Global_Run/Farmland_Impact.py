@@ -18,13 +18,15 @@ def _load_farmland(farmland_source, bbox):
     """Read cropland polygons inside bbox.
 
     farmland_source may be:
-      - a directory containing tiled cropland parquets (Global_Run case);
-        only tiles overlapping bbox are read.
+      - a directory containing tiled cropland parquets, possibly nested
+        one level deep inside per-tile chunk subfolders written by
+        Simplify_Cropland (Path A). The '**/*.parquet' pattern picks up
+        both top-level tile files AND chunks inside subfolders.
       - a single pre-merged parquet (legacy case).
     """
-    folder, fallback_path = resolve_source(farmland_source, '*.parquet')
+    folder, fallback_path = resolve_source(farmland_source, '**/*.parquet')
     if folder is not None:
-        return read_tiles_in_bbox(folder, '*.parquet', bbox=tuple(bbox))
+        return read_tiles_in_bbox(folder, '**/*.parquet', bbox=tuple(bbox))
     return gpd.read_parquet(fallback_path, bbox=tuple(bbox))
 
 
