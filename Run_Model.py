@@ -98,33 +98,33 @@ class GlobalImpactWorkflow:
         rivers_split = [rivers[i:i+n] for i in range(0, len(rivers), n)]
 
         # ----- Population -----
-        args = [(vpu_file, rivs, self.config['population_source']) for rivs in rivers_split]
-        pop_dfs = list(tqdm.tqdm(
-            pool.imap_unordered(calculate_basin_population_wrapper, args),
-            total=len(args), desc=f"[vpu={vpu_id}] Population    "
-        ))
-        pop_result = pd.concat(pop_dfs, ignore_index=True)
-        pop_gdf = gpd.GeoDataFrame(
-            pop_result,
-            geometry=gpd.points_from_xy(pop_result['x'], pop_result['y']),
-            crs='EPSG:4326'
-        )
-        pop_gdf.to_parquet(vpu_stats_dir / "population_statistics.parquet", index=False)
-        aggregate_population_for_csv(pop_result).to_csv(
-            vpu_stats_dir / "population_statistics.csv", index=False
-        )
+       #args = [(vpu_file, rivs, self.config['population_source']) for rivs in rivers_split]
+       #pop_dfs = list(tqdm.tqdm(
+       #    pool.imap_unordered(calculate_basin_population_wrapper, args),
+       #    total=len(args), desc=f"[vpu={vpu_id}] Population    "
+       #))
+       #pop_result = pd.concat(pop_dfs, ignore_index=True)
+       #pop_gdf = gpd.GeoDataFrame(
+       #    pop_result,
+       #    geometry=gpd.points_from_xy(pop_result['x'], pop_result['y']),
+       #    crs='EPSG:4326'
+       #)
+       #pop_gdf.to_parquet(vpu_stats_dir / "population_statistics.parquet", index=False)
+       #aggregate_population_for_csv(pop_result).to_csv(
+       #    vpu_stats_dir / "population_statistics.csv", index=False
+       #)
 
         # ----- Farmland -----
-        args = [(vpu_file, rivs, self.config['farmland_source']) for rivs in rivers_split]
-        farm_gdfs = list(tqdm.tqdm(
-            pool.imap_unordered(calculate_basin_farmland_wrapper, args),
-            total=len(args), desc=f"[vpu={vpu_id}] Farmland      "
-        ))
-        farm_result = gpd.GeoDataFrame(pd.concat(farm_gdfs, ignore_index=True), crs='EPSG:4326')
-        farm_result.to_parquet(vpu_stats_dir / "farmland_statistics.parquet", index=False)
-        aggregate_farmland_for_csv(farm_result).to_csv(
-            vpu_stats_dir / "farmland_statistics.csv", index=False
-        )
+       #args = [(vpu_file, rivs, self.config['farmland_source']) for rivs in rivers_split]
+       #farm_gdfs = list(tqdm.tqdm(
+       #    pool.imap_unordered(calculate_basin_farmland_wrapper, args),
+       #    total=len(args), desc=f"[vpu={vpu_id}] Farmland      "
+       #))
+       #farm_result = gpd.GeoDataFrame(pd.concat(farm_gdfs, ignore_index=True), crs='EPSG:4326')
+       #farm_result.to_parquet(vpu_stats_dir / "farmland_statistics.parquet", index=False)
+       #aggregate_farmland_for_csv(farm_result).to_csv(
+       #    vpu_stats_dir / "farmland_statistics.csv", index=False
+       #)
 
         # ----- Buildings -----
         args = [(vpu_file, rivs, self.config['building_source']) for rivs in rivers_split]
@@ -288,23 +288,23 @@ class GlobalImpactWorkflow:
 # ===== USAGE =====
 if __name__ == "__main__":
     # Folder containing vpu=NNN/catchments_NNN.parquet (Hive partitioned)
-    catchments_folder = r"D:\Brian\Flood_Impact_Model\Files\Catchment\GEOGLOW_Catchments"
+    catchments_folder = "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/Catchment/GEOGLOW_Catchments"
 
     # Folders of tiled inputs. Each impact module bbox-filters per basin chunk.
     config = {
-        'population_source':     r"D:\Brian\Flood_Impact_Model\Files\Population\population.parquet",
-        'farmland_source':       r"D:\Brian\Flood_Impact_Model\Files\ESA\bbox",
-        'building_source':       r"D:\Brian\Flood_Impact_Model\Files\OSM\Parquet",
-        'transportation_source': r"D:\Brian\Flood_Impact_Model\Files\OSM\Parquet",
+        'population_source':     "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/Population/population.parquet",
+        'farmland_source':       "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/ESA/bbox",
+        'building_source':       "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/OSM/Parquet_sorted",
+        'transportation_source': "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/OSM/Parquet_sorted",
     }
 
-    master_output_folder = r"D:\Brian\Flood_Impact_Model\Global_Impact_Results"
+    master_output_folder = "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Global_Impact_Results"
 
     workflow = GlobalImpactWorkflow(
         catchments_folder=catchments_folder,
         config=config,
         master_output_folder=master_output_folder,
-        max_workers=mp.cpu_count() // 2,  # tune to your RAM (~3-4 GB per worker on big VPUs)
+        max_workers=mp.cpu_count() // 4,  # tune to your RAM (~3-4 GB per worker on big VPUs)
         chunk_size=100
     )
     workflow.run_all_analyses()

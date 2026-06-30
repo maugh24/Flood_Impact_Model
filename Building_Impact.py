@@ -81,13 +81,22 @@ def calculate_basin_buildings(basin_file, rivers, building_source):
         buildings = buildings.to_crs(basins.crs)
 
     # Centroid-in-basin assignment so a building straddling a basin boundary
-    # only gets counted once (the basin its centroid falls in).
-    buildings_centroids = buildings.copy()
-    buildings_centroids['geometry'] = buildings.geometry.centroid
+    # only gets counted once (the basin its centroid falls in). Replace the
+    # polygon geometry with its centroid in place instead of .copy()-ing the
+    # whole frame first: the copy held the heavy building polygons in memory
+    # twice, which was a major source of the building-pass memory spike.
+    # Swapping polygons for points also makes the sjoin below far lighter.
+    buildings = buildings.set_geometry(buildings.geometry.centroid)
+
+    # Only the basin id is needed from the join. Restricting basins to
+    # [LINKNO, geometry] keeps the joined frame small (the catchment file
+    # carries many other attribute columns that sjoin would otherwise copy
+    # onto every building row).
+    basins_join = basins[['LINKNO', 'geometry']]
 
     buildings_in_basins = gpd.sjoin(
-        buildings_centroids,
-        basins,
+        buildings,
+        basins_join,
         how='inner',
         predicate='within'
     )
