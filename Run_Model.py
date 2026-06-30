@@ -82,6 +82,12 @@ class GlobalImpactWorkflow:
     def _vpu_already_done(self, vpu_stats_dir):
         return all((vpu_stats_dir / name).exists() for name in _REQUIRED_CSVS)
 
+    @staticmethod
+    def _stat_done(vpu_stats_dir, csv_name):
+        """True if this statistic's CSV already exists for the VPU, so the
+        pass can be skipped and only unfinished statistics are recomputed."""
+        return (vpu_stats_dir / csv_name).exists()
+
     def _run_vpu(self, vpu_id, vpu_file, pool):
         vpu_stats_dir = self.stats_root / f"vpu={vpu_id}"
         if self._vpu_already_done(vpu_stats_dir):
@@ -98,77 +104,89 @@ class GlobalImpactWorkflow:
         rivers_split = [rivers[i:i+n] for i in range(0, len(rivers), n)]
 
         # ----- Population -----
-       #args = [(vpu_file, rivs, self.config['population_source']) for rivs in rivers_split]
-       #pop_dfs = list(tqdm.tqdm(
-       #    pool.imap_unordered(calculate_basin_population_wrapper, args),
-       #    total=len(args), desc=f"[vpu={vpu_id}] Population    "
-       #))
-       #pop_result = pd.concat(pop_dfs, ignore_index=True)
-       #pop_gdf = gpd.GeoDataFrame(
-       #    pop_result,
-       #    geometry=gpd.points_from_xy(pop_result['x'], pop_result['y']),
-       #    crs='EPSG:4326'
-       #)
-       #pop_gdf.to_parquet(vpu_stats_dir / "population_statistics.parquet", index=False)
-       #aggregate_population_for_csv(pop_result).to_csv(
-       #    vpu_stats_dir / "population_statistics.csv", index=False
-       #)
+        if self._stat_done(vpu_stats_dir, "population_statistics.csv"):
+            print(f"  [vpu={vpu_id}] population already done, skipping")
+        else:
+            args = [(vpu_file, rivs, self.config['population_source']) for rivs in rivers_split]
+            pop_dfs = list(tqdm.tqdm(
+                pool.imap_unordered(calculate_basin_population_wrapper, args),
+                total=len(args), desc=f"[vpu={vpu_id}] Population    "
+            ))
+            pop_result = pd.concat(pop_dfs, ignore_index=True)
+            pop_gdf = gpd.GeoDataFrame(
+                pop_result,
+                geometry=gpd.points_from_xy(pop_result['x'], pop_result['y']),
+                crs='EPSG:4326'
+            )
+            pop_gdf.to_parquet(vpu_stats_dir / "population_statistics.parquet", index=False)
+            aggregate_population_for_csv(pop_result).to_csv(
+                vpu_stats_dir / "population_statistics.csv", index=False
+            )
 
         # ----- Farmland -----
-       #args = [(vpu_file, rivs, self.config['farmland_source']) for rivs in rivers_split]
-       #farm_gdfs = list(tqdm.tqdm(
-       #    pool.imap_unordered(calculate_basin_farmland_wrapper, args),
-       #    total=len(args), desc=f"[vpu={vpu_id}] Farmland      "
-       #))
-       #farm_result = gpd.GeoDataFrame(pd.concat(farm_gdfs, ignore_index=True), crs='EPSG:4326')
-       #farm_result.to_parquet(vpu_stats_dir / "farmland_statistics.parquet", index=False)
-       #aggregate_farmland_for_csv(farm_result).to_csv(
-       #    vpu_stats_dir / "farmland_statistics.csv", index=False
-       #)
+        if self._stat_done(vpu_stats_dir, "farmland_statistics.csv"):
+            print(f"  [vpu={vpu_id}] farmland already done, skipping")
+        else:
+            args = [(vpu_file, rivs, self.config['farmland_source']) for rivs in rivers_split]
+            farm_gdfs = list(tqdm.tqdm(
+                pool.imap_unordered(calculate_basin_farmland_wrapper, args),
+                total=len(args), desc=f"[vpu={vpu_id}] Farmland      "
+            ))
+            farm_result = gpd.GeoDataFrame(pd.concat(farm_gdfs, ignore_index=True), crs='EPSG:4326')
+            farm_result.to_parquet(vpu_stats_dir / "farmland_statistics.parquet", index=False)
+            aggregate_farmland_for_csv(farm_result).to_csv(
+                vpu_stats_dir / "farmland_statistics.csv", index=False
+            )
 
         # ----- Buildings -----
-        args = [(vpu_file, rivs, self.config['building_source']) for rivs in rivers_split]
-        building_dfs = list(tqdm.tqdm(
-            pool.imap_unordered(calculate_basin_building_wrapper, args),
-            total=len(args), desc=f"[vpu={vpu_id}] Buildings     "
-        ))
-        building_result = pd.concat(building_dfs, ignore_index=True)
-        building_gdf = gpd.GeoDataFrame(
-            building_result,
-            geometry=gpd.points_from_xy(building_result['x'], building_result['y']),
-            crs='EPSG:4326'
-        )
-        building_count = (
-            building_result[building_result['LINKNO'] != 'TOTAL']
-                .groupby('LINKNO').size().reset_index(name='building_count')
-        )
-        total_buildings = building_result[building_result['LINKNO'] != 'TOTAL'].shape[0]
-        building_count_with_total = pd.concat([
-            pd.DataFrame({'LINKNO': ['TOTAL'], 'building_count': [total_buildings]}),
-            building_count
-        ], ignore_index=True)
-        building_gdf.to_parquet(vpu_stats_dir / "building_statistics.parquet", index=False)
-        building_count_with_total.to_csv(vpu_stats_dir / "building_statistics.csv", index=False)
+        if self._stat_done(vpu_stats_dir, "building_statistics.csv"):
+            print(f"  [vpu={vpu_id}] buildings already done, skipping")
+        else:
+            args = [(vpu_file, rivs, self.config['building_source']) for rivs in rivers_split]
+            building_dfs = list(tqdm.tqdm(
+                pool.imap_unordered(calculate_basin_building_wrapper, args),
+                total=len(args), desc=f"[vpu={vpu_id}] Buildings     "
+            ))
+            building_result = pd.concat(building_dfs, ignore_index=True)
+            building_gdf = gpd.GeoDataFrame(
+                building_result,
+                geometry=gpd.points_from_xy(building_result['x'], building_result['y']),
+                crs='EPSG:4326'
+            )
+            building_count = (
+                building_result[building_result['LINKNO'] != 'TOTAL']
+                    .groupby('LINKNO').size().reset_index(name='building_count')
+            )
+            total_buildings = building_result[building_result['LINKNO'] != 'TOTAL'].shape[0]
+            building_count_with_total = pd.concat([
+                pd.DataFrame({'LINKNO': ['TOTAL'], 'building_count': [total_buildings]}),
+                building_count
+            ], ignore_index=True)
+            building_gdf.to_parquet(vpu_stats_dir / "building_statistics.parquet", index=False)
+            building_count_with_total.to_csv(vpu_stats_dir / "building_statistics.csv", index=False)
 
         # ----- Transportation -----
-        args = [(vpu_file, rivs, self.config['transportation_source']) for rivs in rivers_split]
-        trans_dfs = list(tqdm.tqdm(
-            pool.imap_unordered(calculate_basin_transportation_wrapper, args),
-            total=len(args), desc=f"[vpu={vpu_id}] Transportation"
-        ))
-        if trans_dfs:
-            trans_result = gpd.GeoDataFrame(pd.concat(trans_dfs, ignore_index=True),
-                                            geometry='geometry', crs='EPSG:4326')
+        if self._stat_done(vpu_stats_dir, "transportation_statistics.csv"):
+            print(f"  [vpu={vpu_id}] transportation already done, skipping")
         else:
-            trans_result = gpd.GeoDataFrame(
-                columns=['LINKNO', 'infrastructure_type', 'feature_value',
-                         'length_m', 'length_km', 'geometry'],
-                geometry='geometry', crs='EPSG:4326'
+            args = [(vpu_file, rivs, self.config['transportation_source']) for rivs in rivers_split]
+            trans_dfs = list(tqdm.tqdm(
+                pool.imap_unordered(calculate_basin_transportation_wrapper, args),
+                total=len(args), desc=f"[vpu={vpu_id}] Transportation"
+            ))
+            if trans_dfs:
+                trans_result = gpd.GeoDataFrame(pd.concat(trans_dfs, ignore_index=True),
+                                                geometry='geometry', crs='EPSG:4326')
+            else:
+                trans_result = gpd.GeoDataFrame(
+                    columns=['LINKNO', 'infrastructure_type', 'feature_value',
+                             'length_m', 'length_km', 'geometry'],
+                    geometry='geometry', crs='EPSG:4326'
+                )
+            trans_result.to_parquet(vpu_stats_dir / "transportation_statistics.parquet", index=False)
+            aggregate_transportation_for_csv(trans_result).to_csv(
+                vpu_stats_dir / "transportation_statistics.csv", index=False
             )
-        trans_result.to_parquet(vpu_stats_dir / "transportation_statistics.parquet", index=False)
-        aggregate_transportation_for_csv(trans_result).to_csv(
-            vpu_stats_dir / "transportation_statistics.csv", index=False
-        )
 
     # ----- global summary -----
 
