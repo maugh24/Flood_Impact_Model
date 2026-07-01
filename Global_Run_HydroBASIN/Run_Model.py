@@ -365,6 +365,6 @@ if __name__ == "__main__":
         config=config,
         master_output_folder=master_output_folder,
         max_workers=mp.cpu_count(),  # tune to your RAM (~3-4 GB per worker on dense chunks)
-        chunk_size=200  # smaller chunks: tighter per-chunk bbox + shorter overlay tail on dense regions
+        chunk_size=201  # smaller chunks: tighter per-chunk bbox + shorter overlay tail on dense regions
     )
     workflow.run_all_analyses()
