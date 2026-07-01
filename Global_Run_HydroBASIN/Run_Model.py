@@ -1,15 +1,18 @@
 """
 Global impact analysis orchestrator - HydroBASINS (single-file, in-memory) variant.
 
-Instead of iterating Hive-partitioned TDX VPU files, this loads ONE global
-HUC12 HydroBASINS parquet once, spatially sorts the basins, splits them into
-fixed-size chunks, and runs the four impact analyses over those chunks in a
-worker pool. Each worker is handed its chunk's basins GeoDataFrame directly, so
-the 1M-row basin file is never re-read per chunk. The basin id column is
-HYBAS_ID.
+Loads ONE global HUC12 HydroBASINS parquet once, spatially sorts the basins,
+splits them into fixed-size chunks, and runs the four impact analyses over
+those chunks in a worker pool. Each worker is handed its chunk's basins
+GeoDataFrame directly, so the 1M-row basin file is never re-read per chunk.
+Basin id column is HYBAS_ID.
 
-OSM and ESA inputs are still folders of tiled parquets; each impact module
-bbox-filters the tiles relevant to each chunk.
+Results are streamed to disk chunk-by-chunk: each statistic's geometry parquet
+is written incrementally (one row group per chunk) via a ParquetWriter, and
+only the small per-basin aggregates are held in memory for the CSV. This avoids
+(a) holding every clipped geometry worldwide in memory at once and (b) Arrow's
+2 GB single-array limit that a one-shot GeoDataFrame.to_parquet hits at global
+scale.
 
 Output layout (a single set of files - there are no VPUs here):
     master_output/
@@ -20,28 +23,65 @@ Output layout (a single set of files - there are no VPUs here):
             transportation_statistics.{parquet,csv}
             Global_Summary.csv
 
-Per-statistic resume: a statistic whose CSV already exists is skipped, so a
-re-run only recomputes the unfinished statistics.
+Per-statistic resume: a statistic whose CSV already exists is skipped.
 """
-import geopandas as gpd
-import pandas as pd
-from pathlib import Path
+import io
 import time
-from datetime import datetime
 import warnings
 import multiprocessing as mp
+from pathlib import Path
+from datetime import datetime
+
 import numpy as np
+import pandas as pd
+import geopandas as gpd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import tqdm
 
 warnings.filterwarnings('ignore')
 
-from Global_Run_TDX.Population_Impact import calculate_basin_population_wrapper, aggregate_population_for_csv
-from Global_Run_TDX.Farmland_Impact import calculate_basin_farmland_wrapper, aggregate_farmland_for_csv
-from Global_Run_TDX.Building_Impact import calculate_basin_building_wrapper
-from Global_Run_TDX.Road_Impact import calculate_basin_transportation_wrapper, aggregate_transportation_for_csv
+from Population_Impact import calculate_basin_population_wrapper
+from Farmland_Impact import calculate_basin_farmland_wrapper
+from Building_Impact import calculate_basin_building_wrapper
+from Road_Impact import calculate_basin_transportation_wrapper
 
 # Basin id column for the HydroBASINS file.
 BASIN_ID = "HYBAS_ID"
+
+
+class _GeoStreamWriter:
+    """Append GeoDataFrames to a single GeoParquet file as successive row
+    groups. Keeps peak memory at ~one chunk and keeps every WKB array well
+    under Arrow's 2 GB per-array limit. Rows with null geometry are dropped
+    (missing basins still reach the CSV via the per-basin aggregation)."""
+
+    def __init__(self, path):
+        self.path = str(path)
+        self._writer = None
+        self._geo = None
+
+    def write(self, gdf):
+        if gdf is None or len(gdf) == 0:
+            return
+        gdf = gdf[gdf.geometry.notna()]
+        if len(gdf) == 0:
+            return
+        gdf = gdf.reset_index(drop=True)  # avoid an index column in the arrow table
+        if self._geo is None:
+            buf = io.BytesIO()
+            gdf.head(0).to_parquet(buf)
+            buf.seek(0)
+            self._geo = pq.read_schema(buf).metadata[b'geo']
+        table = pa.table(gdf.to_arrow(geometry_encoding='WKB'))
+        table = table.replace_schema_metadata({**(table.schema.metadata or {}), b'geo': self._geo})
+        if self._writer is None:
+            self._writer = pq.ParquetWriter(self.path, table.schema)
+        self._writer.write_table(table)
+
+    def close(self):
+        if self._writer is not None:
+            self._writer.close()
 
 
 class GlobalImpactWorkflow:
@@ -71,7 +111,6 @@ class GlobalImpactWorkflow:
         try:
             gdf = gpd.read_parquet(self.basin_file, columns=cols)
         except Exception:
-            # PFAF_ID missing for some reason - fall back to id + geometry.
             gdf = gpd.read_parquet(self.basin_file, columns=[BASIN_ID, 'geometry'])
 
         if gdf.crs is None:
@@ -79,116 +118,134 @@ class GlobalImpactWorkflow:
         elif gdf.crs.to_epsg() != 4326:
             gdf = gdf.to_crs('EPSG:4326')
 
-        # Spatial-ish ordering so consecutive chunks are geographically close,
-        # which keeps each chunk's bbox tight and reuses cached OSM/ESA tiles.
-        # PFAF_ID (Pfafstetter) is hierarchical/spatially coherent and free to
-        # sort on; fall back to centroid distance from (0,0) if it's absent.
+        # PFAF_ID (Pfafstetter) is hierarchical / spatially coherent and free
+        # to sort on; fall back to centroid distance from (0,0) if absent.
         if 'PFAF_ID' in gdf.columns:
             gdf = gdf.sort_values('PFAF_ID')
         else:
             c = gdf.geometry.centroid
             gdf = gdf.assign(_d=np.sqrt(c.x ** 2 + c.y ** 2)).sort_values('_d')
 
-        gdf = gdf[[BASIN_ID, 'geometry']].reset_index(drop=True)
-        return gdf
+        return gdf[[BASIN_ID, 'geometry']].reset_index(drop=True)
 
     def _iter_chunks(self):
         """Yield successive [HYBAS_ID, geometry] chunks of chunk_size basins.
-        A fresh generator is produced on each call so every statistic can
-        iterate the full basin set."""
+        A fresh generator is produced per call so every statistic can iterate
+        the full basin set."""
         n = self.chunk_size
         gdf = self.basins
         for i in range(0, len(gdf), n):
             yield gdf.iloc[i:i + n]
 
     def _stat_done(self, csv_name):
-        """True if this statistic's CSV already exists, so it can be skipped."""
         return (self.stats_root / csv_name).exists()
 
-    # ----- the four statistics -----
+    def _args(self, source_key):
+        return ((chunk, self.config[source_key]) for chunk in self._iter_chunks())
+
+    # ----- the four statistics (streamed) -----
 
     def _run_population(self, pool):
         if self._stat_done("population_statistics.csv"):
             print("  population already done, skipping")
             return
-        args = ((chunk, self.config['population_source']) for chunk in self._iter_chunks())
-        pop_dfs = list(tqdm.tqdm(
-            pool.imap_unordered(calculate_basin_population_wrapper, args),
-            total=self.n_chunks, desc="Population    "
-        ))
-        pop_result = pd.concat(pop_dfs, ignore_index=True)
-        pop_gdf = gpd.GeoDataFrame(
-            pop_result,
-            geometry=gpd.points_from_xy(pop_result['x'], pop_result['y']),
-            crs='EPSG:4326'
-        )
-        pop_gdf.to_parquet(self.stats_root / "population_statistics.parquet", index=False)
-        aggregate_population_for_csv(pop_result).to_csv(
-            self.stats_root / "population_statistics.csv", index=False
-        )
+        writer = _GeoStreamWriter(self.stats_root / "population_statistics.parquet")
+        parts = []
+        for res in tqdm.tqdm(pool.imap_unordered(calculate_basin_population_wrapper,
+                                                 self._args('population_source')),
+                             total=self.n_chunks, desc="Population    ",
+                             mininterval=0.5, dynamic_ncols=True):
+            real = res[res['x'].notna()]
+            if len(real):
+                writer.write(gpd.GeoDataFrame(
+                    real, geometry=gpd.points_from_xy(real['x'], real['y']), crs='EPSG:4326'))
+            parts.append(pd.DataFrame(res).groupby(BASIN_ID, dropna=False, as_index=False)
+                         ['pop_value'].sum(min_count=1))
+        writer.close()
+        self._write_sum_csv(parts, 'pop_value', "population_statistics.csv")
 
     def _run_farmland(self, pool):
         if self._stat_done("farmland_statistics.csv"):
             print("  farmland already done, skipping")
             return
-        args = ((chunk, self.config['farmland_source']) for chunk in self._iter_chunks())
-        farm_gdfs = list(tqdm.tqdm(
-            pool.imap_unordered(calculate_basin_farmland_wrapper, args),
-            total=self.n_chunks, desc="Farmland      "
-        ))
-        farm_result = gpd.GeoDataFrame(pd.concat(farm_gdfs, ignore_index=True), crs='EPSG:4326')
-        farm_result.to_parquet(self.stats_root / "farmland_statistics.parquet", index=False)
-        aggregate_farmland_for_csv(farm_result).to_csv(
-            self.stats_root / "farmland_statistics.csv", index=False
-        )
+        writer = _GeoStreamWriter(self.stats_root / "farmland_statistics.parquet")
+        parts = []
+        for res in tqdm.tqdm(pool.imap_unordered(calculate_basin_farmland_wrapper,
+                                                 self._args('farmland_source')),
+                             total=self.n_chunks, desc="Farmland      ",
+                             mininterval=0.5, dynamic_ncols=True):
+            writer.write(res)
+            parts.append(pd.DataFrame(res.drop(columns='geometry', errors='ignore'))
+                         .groupby(BASIN_ID, dropna=False, as_index=False)['area_m2'].sum(min_count=1))
+        writer.close()
+        self._write_sum_csv(parts, 'area_m2', "farmland_statistics.csv")
 
     def _run_buildings(self, pool):
         if self._stat_done("building_statistics.csv"):
             print("  buildings already done, skipping")
             return
-        args = ((chunk, self.config['building_source']) for chunk in self._iter_chunks())
-        building_dfs = list(tqdm.tqdm(
-            pool.imap_unordered(calculate_basin_building_wrapper, args),
-            total=self.n_chunks, desc="Buildings     "
-        ))
-        building_result = pd.concat(building_dfs, ignore_index=True)
-        building_gdf = gpd.GeoDataFrame(
-            building_result,
-            geometry=gpd.points_from_xy(building_result['x'], building_result['y']),
-            crs='EPSG:4326'
-        )
-        real = building_result[building_result[BASIN_ID] != 'TOTAL']
-        building_count = real.groupby(BASIN_ID).size().reset_index(name='building_count')
-        total_buildings = real.shape[0]
-        building_count_with_total = pd.concat([
-            pd.DataFrame({BASIN_ID: ['TOTAL'], 'building_count': [total_buildings]}),
-            building_count
-        ], ignore_index=True)
-        building_gdf.to_parquet(self.stats_root / "building_statistics.parquet", index=False)
-        building_count_with_total.to_csv(self.stats_root / "building_statistics.csv", index=False)
+        writer = _GeoStreamWriter(self.stats_root / "building_statistics.parquet")
+        counts = []
+        total = 0
+        for res in tqdm.tqdm(pool.imap_unordered(calculate_basin_building_wrapper,
+                                                 self._args('building_source')),
+                             total=self.n_chunks, desc="Buildings     ",
+                             mininterval=0.5, dynamic_ncols=True):
+            real = res[res['building'].notna()]   # actual buildings (not empty-basin placeholders)
+            if len(real):
+                writer.write(gpd.GeoDataFrame(
+                    real, geometry=gpd.points_from_xy(real['x'], real['y']), crs='EPSG:4326'))
+                counts.append(real.groupby(BASIN_ID).size().reset_index(name='building_count'))
+                total += len(real)
+        writer.close()
+        per_basin = (pd.concat(counts, ignore_index=True) if counts
+                     else pd.DataFrame({BASIN_ID: [], 'building_count': []}))
+        out = pd.concat([pd.DataFrame({BASIN_ID: ['TOTAL'], 'building_count': [total]}),
+                         per_basin], ignore_index=True)
+        out.to_csv(self.stats_root / "building_statistics.csv", index=False)
 
     def _run_transportation(self, pool):
         if self._stat_done("transportation_statistics.csv"):
             print("  transportation already done, skipping")
             return
-        args = ((chunk, self.config['transportation_source']) for chunk in self._iter_chunks())
-        trans_dfs = list(tqdm.tqdm(
-            pool.imap_unordered(calculate_basin_transportation_wrapper, args),
-            total=self.n_chunks, desc="Transportation"
-        ))
-        if trans_dfs:
-            trans_result = gpd.GeoDataFrame(pd.concat(trans_dfs, ignore_index=True),
-                                            geometry='geometry', crs='EPSG:4326')
+        writer = _GeoStreamWriter(self.stats_root / "transportation_statistics.parquet")
+        pivots = []
+        for res in tqdm.tqdm(pool.imap_unordered(calculate_basin_transportation_wrapper,
+                                                 self._args('transportation_source')),
+                             total=self.n_chunks, desc="Transportation",
+                             mininterval=0.5, dynamic_ncols=True):
+            writer.write(res)
+            df = pd.DataFrame(res.drop(columns='geometry', errors='ignore'))
+            if len(df):
+                pivots.append(df.groupby([BASIN_ID, 'infrastructure_type'])['length_km']
+                              .sum(min_count=1).unstack('infrastructure_type'))
+        writer.close()
+
+        if pivots:
+            piv = pd.concat(pivots).rename(columns={'highway': 'highway_km', 'railway': 'railway_km'})
+            for c in ('highway_km', 'railway_km'):
+                if c not in piv.columns:
+                    piv[c] = None
+            per_basin = piv.reset_index()[[BASIN_ID, 'highway_km', 'railway_km']]
         else:
-            trans_result = gpd.GeoDataFrame(
-                columns=[BASIN_ID, 'infrastructure_type', 'feature_value',
-                         'length_m', 'length_km', 'geometry'],
-                geometry='geometry', crs='EPSG:4326'
-            )
-        trans_result.to_parquet(self.stats_root / "transportation_statistics.parquet", index=False)
-        aggregate_transportation_for_csv(trans_result).to_csv(
-            self.stats_root / "transportation_statistics.csv", index=False
-        )
+            per_basin = pd.DataFrame({BASIN_ID: [], 'highway_km': [], 'railway_km': []})
+        total_row = pd.DataFrame({
+            BASIN_ID: ['TOTAL'],
+            'highway_km': [per_basin['highway_km'].sum(min_count=1)],
+            'railway_km': [per_basin['railway_km'].sum(min_count=1)],
+        })
+        pd.concat([total_row, per_basin], ignore_index=True).to_csv(
+            self.stats_root / "transportation_statistics.csv", index=False)
+
+    def _write_sum_csv(self, parts, value_col, csv_name):
+        """Combine per-chunk per-basin sums (basins are partitioned across
+        chunks, so no basin spans two chunks) and prepend a TOTAL row."""
+        per_basin = (pd.concat(parts, ignore_index=True) if parts
+                     else pd.DataFrame({BASIN_ID: [], value_col: []}))
+        total = per_basin[value_col].sum(min_count=1) if len(per_basin) else float('nan')
+        out = pd.concat([pd.DataFrame({BASIN_ID: ['TOTAL'], value_col: [total]}),
+                         per_basin], ignore_index=True)
+        out.to_csv(self.stats_root / csv_name, index=False)
 
     # ----- global summary -----
 
@@ -227,7 +284,7 @@ class GlobalImpactWorkflow:
 
     def run_all_analyses(self):
         print("=" * 80)
-        print("GLOBAL IMPACT ANALYSIS WORKFLOW - HydroBASINS (in-memory)")
+        print("GLOBAL IMPACT ANALYSIS WORKFLOW - HydroBASINS (in-memory, streamed)")
         print("=" * 80)
         print(f"Start time:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Basin file:    {self.basin_file}")
@@ -281,6 +338,6 @@ if __name__ == "__main__":
         config=config,
         master_output_folder=master_output_folder,
         max_workers=mp.cpu_count(),  # tune to your RAM (~3-4 GB per worker on dense chunks)
-        chunk_size=100
+        chunk_size=1000
     )
     workflow.run_all_analyses()
