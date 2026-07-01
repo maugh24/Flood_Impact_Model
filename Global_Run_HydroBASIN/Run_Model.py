@@ -35,10 +35,10 @@ import tqdm
 
 warnings.filterwarnings('ignore')
 
-from Population_Impact import calculate_basin_population_wrapper, aggregate_population_for_csv
-from Farmland_Impact import calculate_basin_farmland_wrapper, aggregate_farmland_for_csv
-from Building_Impact import calculate_basin_building_wrapper
-from Road_Impact import calculate_basin_transportation_wrapper, aggregate_transportation_for_csv
+from Global_Run_TDX.Population_Impact import calculate_basin_population_wrapper, aggregate_population_for_csv
+from Global_Run_TDX.Farmland_Impact import calculate_basin_farmland_wrapper, aggregate_farmland_for_csv
+from Global_Run_TDX.Building_Impact import calculate_basin_building_wrapper
+from Global_Run_TDX.Road_Impact import calculate_basin_transportation_wrapper, aggregate_transportation_for_csv
 
 # Basin id column for the HydroBASINS file.
 BASIN_ID = "HYBAS_ID"

@@ -3,7 +3,7 @@ import geopandas as gpd
 import pandas as pd
 import pyarrow.dataset as ds
 
-from tile_loader import read_tiles_in_bbox, resolve_source
+from Global_Run_TDX.tile_loader import read_tiles_in_bbox, resolve_source
 
 
 _BUILDING_VALUES = [

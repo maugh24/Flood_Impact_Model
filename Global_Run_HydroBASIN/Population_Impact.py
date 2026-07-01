@@ -2,7 +2,7 @@ import os
 import geopandas as gpd
 import pandas as pd
 
-from tile_loader import read_tiles_in_bbox, resolve_source
+from Global_Run_TDX.tile_loader import read_tiles_in_bbox, resolve_source
 
 # Basin id column. HydroBASINS uses HYBAS_ID (TDX used LINKNO).
 BASIN_ID = "HYBAS_ID"

@@ -36,11 +36,11 @@ import tqdm
 
 warnings.filterwarnings('ignore')
 
-from Population_Impact import calculate_basin_population_wrapper, aggregate_population_for_csv
-from Farmland_Impact import calculate_basin_farmland_wrapper, aggregate_farmland_for_csv
-from Building_Impact import calculate_basin_building_wrapper
-from Road_Impact import calculate_basin_transportation_wrapper, aggregate_transportation_for_csv
-from tile_loader import iter_vpu_files
+from Global_Run_TDX.Population_Impact import calculate_basin_population_wrapper, aggregate_population_for_csv
+from Global_Run_TDX.Farmland_Impact import calculate_basin_farmland_wrapper, aggregate_farmland_for_csv
+from Global_Run_TDX.Building_Impact import calculate_basin_building_wrapper
+from Global_Run_TDX.Road_Impact import calculate_basin_transportation_wrapper, aggregate_transportation_for_csv
+from Global_Run_TDX.tile_loader import iter_vpu_files
 
 
 # Filenames a completed VPU should have. Used by the skip check.
