@@ -54,12 +54,32 @@ class _GeoStreamWriter:
     """Append GeoDataFrames to a single GeoParquet file as successive row
     groups. Keeps peak memory at ~one chunk and keeps every WKB array well
     under Arrow's 2 GB per-array limit. Rows with null geometry are dropped
-    (missing basins still reach the CSV via the per-basin aggregation)."""
+    (missing basins still reach the CSV via the per-basin aggregation).
+
+    The first written chunk fixes the file schema; every later chunk is cast
+    to it. Object columns that happen to be all-empty in a chunk (e.g. a chunk
+    where no building carries an 'amenity', or no road a 'feature_value') get
+    inferred by Arrow as the 'null' type; those are promoted to 'string' so
+    they still match a schema where that column is 'string'."""
 
     def __init__(self, path):
         self.path = str(path)
         self._writer = None
         self._geo = None
+        self._schema = None
+
+    @staticmethod
+    def _promote_null_columns(table):
+        fields, changed = [], False
+        for field in table.schema:
+            if pa.types.is_null(field.type):
+                fields.append(field.with_type(pa.string()))
+                changed = True
+            else:
+                fields.append(field)
+        if not changed:
+            return table
+        return table.cast(pa.schema(fields, metadata=table.schema.metadata))
 
     def write(self, gdf):
         if gdf is None or len(gdf) == 0:
@@ -73,10 +93,17 @@ class _GeoStreamWriter:
             gdf.head(0).to_parquet(buf)
             buf.seek(0)
             self._geo = pq.read_schema(buf).metadata[b'geo']
-        table = pa.table(gdf.to_arrow(geometry_encoding='WKB'))
-        table = table.replace_schema_metadata({**(table.schema.metadata or {}), b'geo': self._geo})
+
+        table = self._promote_null_columns(pa.table(gdf.to_arrow(geometry_encoding='WKB')))
+
         if self._writer is None:
-            self._writer = pq.ParquetWriter(self.path, table.schema)
+            table = table.replace_schema_metadata({**(table.schema.metadata or {}), b'geo': self._geo})
+            self._schema = table.schema
+            self._writer = pq.ParquetWriter(self.path, self._schema)
+        else:
+            # Cast to the file's schema so a chunk that inferred a column
+            # slightly differently (e.g. null vs string) still matches.
+            table = table.cast(self._schema)
         self._writer.write_table(table)
 
     def close(self):
@@ -338,6 +365,6 @@ if __name__ == "__main__":
         config=config,
         master_output_folder=master_output_folder,
         max_workers=mp.cpu_count(),  # tune to your RAM (~3-4 GB per worker on dense chunks)
-        chunk_size=1000
+        chunk_size=200  # smaller chunks: tighter per-chunk bbox + shorter overlay tail on dense regions
     )
     workflow.run_all_analyses()
