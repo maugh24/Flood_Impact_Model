@@ -3,7 +3,7 @@ import geopandas as gpd
 import pandas as pd
 import numpy as np
 
-from Global_Run_TDX.tile_loader import read_tiles_in_bbox, resolve_source
+from tile_loader import read_tiles_in_bbox, resolve_source
 
 
 _HIGHWAY_VALUES = [
