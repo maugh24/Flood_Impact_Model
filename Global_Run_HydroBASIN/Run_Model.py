@@ -56,6 +56,29 @@ from tile_loader import call_with_io_retry
 BASIN_ID = "HYBAS_ID"
 
 
+# Keyed wrappers (top-level so they pickle for the pool). Each attaches the
+# chunk index to its result, so the driver can write a per-chunk checkpoint and,
+# on resume, skip chunks that are already done.
+def _keyed_population(args):
+    key, chunk, source = args
+    return key, calculate_basin_population_wrapper((chunk, source))
+
+
+def _keyed_farmland(args):
+    key, chunk, source = args
+    return key, calculate_basin_farmland_wrapper((chunk, source))
+
+
+def _keyed_building(args):
+    key, chunk, source = args
+    return key, calculate_basin_building_wrapper((chunk, source))
+
+
+def _keyed_transportation(args):
+    key, chunk, source = args
+    return key, calculate_basin_transportation_wrapper((chunk, source))
+
+
 class _GeoStreamWriter:
     """Append GeoDataFrames to a single GeoParquet file as successive row
     groups. Keeps peak memory at ~one chunk and keeps every WKB array well
@@ -221,109 +244,148 @@ class GlobalImpactWorkflow:
             call_with_io_retry(
                 lambda s=sub, d=dst: s.to_parquet(d, write_covering_bbox=True), ())
 
-    # ----- the statistics -----
+    # ----- the statistics (checkpointed per chunk) -----
     # All statistics write a FOLDER of per-basin GeoParquet files
-    # (<HYBAS_ID>_<type>.parquet) plus one combined summary CSV. (The
-    # already-finished global farmland parquet can also be split after the fact
-    # with split_farmland_by_basin.py.)
+    # (<HYBAS_ID>_<type>.parquet) plus one combined summary CSV. Each chunk is
+    # checkpointed with a small CSV fragment under Statistics/_partial/<stat>/;
+    # a chunk whose fragment exists is skipped BEFORE it is sent to the pool, so
+    # a resumed run never recomputes finished chunks. Fragments are stitched
+    # into the combined CSV at the end.
+
+    def _run_checkpointed(self, pool, keyed_wrapper, source_key, stat_name, desc, process_fn):
+        """Compute one statistic, skipping chunks already checkpointed, and
+        checkpoint each finished chunk. process_fn(res) writes that chunk's
+        per-basin geometry files and returns a small per-basin summary
+        DataFrame (the fragment). Returns the partial dir for the combine step."""
+        partial_dir = self.stats_root / "_partial" / stat_name
+        partial_dir.mkdir(parents=True, exist_ok=True)
+
+        def frag(i):
+            return partial_dir / f"chunk_{i:06d}.csv"
+
+        n = self.chunk_size
+        pending_count = sum(1 for i in range(self.n_chunks) if not frag(i).exists())
+        done = self.n_chunks - pending_count
+        if pending_count == 0:
+            print(f"  {stat_name}: all {self.n_chunks} chunks already checkpointed")
+            return partial_dir
+        print(f"  {stat_name}: {done} chunks already done, {pending_count} to compute")
+
+        def pending_args():
+            src = self.config[source_key]
+            for i in range(self.n_chunks):
+                if frag(i).exists():
+                    continue
+                yield (i, self.basins.iloc[i * n:(i + 1) * n], src)
+
+        for key, res in tqdm.tqdm(pool.imap_unordered(keyed_wrapper, pending_args()),
+                                  total=pending_count, desc=desc,
+                                  mininterval=0.5, dynamic_ncols=True):
+            frag_df = process_fn(res)
+            # Fragment written LAST (and via retry) so its existence guarantees
+            # the chunk's geometry files are already on disk.
+            call_with_io_retry(
+                lambda df=frag_df, p=frag(key): df.to_csv(p, index=False), ())
+        return partial_dir
+
+    def _combine_fragments(self, partial_dir, final_csv, value_cols, min_count):
+        """Concatenate every chunk fragment into the combined CSV with a TOTAL
+        row. min_count=True keeps an all-NaN column NaN (area/length/pop);
+        min_count=False uses a plain sum (counts)."""
+        frames = []
+        for f in sorted(partial_dir.glob("chunk_*.csv")):
+            try:
+                d = pd.read_csv(f)
+            except Exception:
+                continue
+            if len(d):
+                frames.append(d)
+        if frames:
+            per_basin = pd.concat(frames, ignore_index=True)
+        else:
+            per_basin = pd.DataFrame({BASIN_ID: [], **{c: [] for c in value_cols}})
+        total = {BASIN_ID: ['TOTAL']}
+        for c in value_cols:
+            if c not in per_basin.columns:
+                per_basin[c] = pd.Series(dtype=float)
+            total[c] = [per_basin[c].sum(min_count=1) if min_count else per_basin[c].sum()]
+        out = pd.concat([pd.DataFrame(total), per_basin], ignore_index=True)
+        out.to_csv(self.stats_root / final_csv, index=False)
 
     def _run_population(self, pool):
         if self._stat_done("population_statistics.csv"):
             print("  population already done, skipping")
             return
-        parts = []
-        for res in tqdm.tqdm(pool.imap_unordered(calculate_basin_population_wrapper,
-                                                 self._args('population_source')),
-                             total=self.n_chunks, desc="Population    ",
-                             mininterval=0.5, dynamic_ncols=True):
+
+        def process(res):
             real = res[res['x'].notna()]
             if len(real):
                 self._write_per_basin(
                     gpd.GeoDataFrame(real, geometry=gpd.points_from_xy(real['x'], real['y']),
                                      crs='EPSG:4326'),
                     "population_by_basin", "population")
-            parts.append(pd.DataFrame(res).groupby(BASIN_ID, dropna=False, as_index=False)
-                         ['pop_value'].sum(min_count=1))
-        self._write_sum_csv(parts, 'pop_value', "population_statistics.csv")
+            return (pd.DataFrame(res).groupby(BASIN_ID, dropna=False, as_index=False)
+                    ['pop_value'].sum(min_count=1))
+
+        partial = self._run_checkpointed(pool, _keyed_population, 'population_source',
+                                         'population', "Population    ", process)
+        self._combine_fragments(partial, "population_statistics.csv", ['pop_value'], min_count=True)
 
     def _run_farmland(self, pool):
         if self._stat_done("farmland_statistics.csv"):
             print("  farmland already done, skipping")
             return
-        parts = []
-        for res in tqdm.tqdm(pool.imap_unordered(calculate_basin_farmland_wrapper,
-                                                 self._args('farmland_source')),
-                             total=self.n_chunks, desc="Farmland      ",
-                             mininterval=0.5, dynamic_ncols=True):
+
+        def process(res):
             self._write_per_basin(res, "farmland_by_basin", "farmland")
-            parts.append(pd.DataFrame(res.drop(columns='geometry', errors='ignore'))
-                         .groupby(BASIN_ID, dropna=False, as_index=False)['area_m2'].sum(min_count=1))
-        self._write_sum_csv(parts, 'area_m2', "farmland_statistics.csv")
+            return (pd.DataFrame(res.drop(columns='geometry', errors='ignore'))
+                    .groupby(BASIN_ID, dropna=False, as_index=False)['area_m2'].sum(min_count=1))
+
+        partial = self._run_checkpointed(pool, _keyed_farmland, 'farmland_source',
+                                         'farmland', "Farmland      ", process)
+        self._combine_fragments(partial, "farmland_statistics.csv", ['area_m2'], min_count=True)
 
     def _run_buildings(self, pool):
         if self._stat_done("building_statistics.csv"):
             print("  buildings already done, skipping")
             return
-        counts = []
-        total = 0
-        for res in tqdm.tqdm(pool.imap_unordered(calculate_basin_building_wrapper,
-                                                 self._args('building_source')),
-                             total=self.n_chunks, desc="Buildings     ",
-                             mininterval=0.5, dynamic_ncols=True):
+
+        def process(res):
             real = res[res['building'].notna()]   # actual buildings (not empty-basin placeholders)
             if len(real):
                 self._write_per_basin(
                     gpd.GeoDataFrame(real, geometry=gpd.points_from_xy(real['x'], real['y']),
                                      crs='EPSG:4326'),
                     "building_by_basin", "buildings")
-                counts.append(real.groupby(BASIN_ID).size().reset_index(name='building_count'))
-                total += len(real)
-        per_basin = (pd.concat(counts, ignore_index=True) if counts
-                     else pd.DataFrame({BASIN_ID: [], 'building_count': []}))
-        out = pd.concat([pd.DataFrame({BASIN_ID: ['TOTAL'], 'building_count': [total]}),
-                         per_basin], ignore_index=True)
-        out.to_csv(self.stats_root / "building_statistics.csv", index=False)
+                return real.groupby(BASIN_ID).size().reset_index(name='building_count')
+            return pd.DataFrame({BASIN_ID: [], 'building_count': []})
+
+        partial = self._run_checkpointed(pool, _keyed_building, 'building_source',
+                                         'building', "Buildings     ", process)
+        self._combine_fragments(partial, "building_statistics.csv", ['building_count'], min_count=False)
 
     def _run_transportation(self, pool):
         if self._stat_done("transportation_statistics.csv"):
             print("  transportation already done, skipping")
             return
-        pivots = []
-        for res in tqdm.tqdm(pool.imap_unordered(calculate_basin_transportation_wrapper,
-                                                 self._args('transportation_source')),
-                             total=self.n_chunks, desc="Transportation",
-                             mininterval=0.5, dynamic_ncols=True):
+
+        def process(res):
             self._write_per_basin(res, "transportation_by_basin", "roads")
             df = pd.DataFrame(res.drop(columns='geometry', errors='ignore'))
             if len(df):
-                pivots.append(df.groupby([BASIN_ID, 'infrastructure_type'])['length_km']
-                              .sum(min_count=1).unstack('infrastructure_type'))
+                piv = (df.groupby([BASIN_ID, 'infrastructure_type'])['length_km']
+                       .sum(min_count=1).unstack('infrastructure_type')
+                       .rename(columns={'highway': 'highway_km', 'railway': 'railway_km'}))
+                for c in ('highway_km', 'railway_km'):
+                    if c not in piv.columns:
+                        piv[c] = None
+                return piv.reset_index()[[BASIN_ID, 'highway_km', 'railway_km']]
+            return pd.DataFrame({BASIN_ID: [], 'highway_km': [], 'railway_km': []})
 
-        if pivots:
-            piv = pd.concat(pivots).rename(columns={'highway': 'highway_km', 'railway': 'railway_km'})
-            for c in ('highway_km', 'railway_km'):
-                if c not in piv.columns:
-                    piv[c] = None
-            per_basin = piv.reset_index()[[BASIN_ID, 'highway_km', 'railway_km']]
-        else:
-            per_basin = pd.DataFrame({BASIN_ID: [], 'highway_km': [], 'railway_km': []})
-        total_row = pd.DataFrame({
-            BASIN_ID: ['TOTAL'],
-            'highway_km': [per_basin['highway_km'].sum(min_count=1)],
-            'railway_km': [per_basin['railway_km'].sum(min_count=1)],
-        })
-        pd.concat([total_row, per_basin], ignore_index=True).to_csv(
-            self.stats_root / "transportation_statistics.csv", index=False)
-
-    def _write_sum_csv(self, parts, value_col, csv_name):
-        """Combine per-chunk per-basin sums (basins are partitioned across
-        chunks, so no basin spans two chunks) and prepend a TOTAL row."""
-        per_basin = (pd.concat(parts, ignore_index=True) if parts
-                     else pd.DataFrame({BASIN_ID: [], value_col: []}))
-        total = per_basin[value_col].sum(min_count=1) if len(per_basin) else float('nan')
-        out = pd.concat([pd.DataFrame({BASIN_ID: ['TOTAL'], value_col: [total]}),
-                         per_basin], ignore_index=True)
-        out.to_csv(self.stats_root / csv_name, index=False)
+        partial = self._run_checkpointed(pool, _keyed_transportation, 'transportation_source',
+                                         'transportation', "Transportation", process)
+        self._combine_fragments(partial, "transportation_statistics.csv",
+                                ['highway_km', 'railway_km'], min_count=True)
 
     # ----- global summary -----
 
