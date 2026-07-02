@@ -120,12 +120,18 @@ class GlobalImpactWorkflow:
     """Loads the global basin file once and streams basin chunks to a pool."""
 
     def __init__(self, basin_file, config, master_output_folder,
-                 max_workers=4, chunk_size=100):
+                 max_workers=4, chunk_size=100, max_tasks_per_child=100):
         self.basin_file = basin_file
         self.config = config
         self.master_output = Path(master_output_folder)
         self.max_workers = max_workers
         self.chunk_size = chunk_size
+        # Recycle each pool worker after this many chunks so memory that
+        # geopandas/GEOS/pyarrow don't return to the OS (C-library
+        # fragmentation) is released instead of climbing until the machine runs
+        # out. Lower = tighter memory ceiling but more worker restarts (each
+        # restart rebuilds the per-worker tile caches).
+        self.max_tasks_per_child = max_tasks_per_child
 
         self.master_output.mkdir(parents=True, exist_ok=True)
         self.stats_root = self.master_output / "Statistics"
@@ -352,7 +358,8 @@ class GlobalImpactWorkflow:
         print("=" * 80)
 
         start = time.time()
-        with mp.Pool(processes=self.max_workers) as pool:
+        with mp.Pool(processes=self.max_workers,
+                     maxtasksperchild=self.max_tasks_per_child) as pool:
             # Population is disabled here (as in the TDX run). Uncomment to enable.
             # self._run_population(pool)
             self._run_farmland(pool)
@@ -389,6 +396,7 @@ if __name__ == "__main__":
         config=config,
         master_output_folder=master_output_folder,
         max_workers=mp.cpu_count(),  # tune to your RAM (~3-4 GB per worker on dense chunks)
-        chunk_size=201  # smaller chunks: tighter per-chunk bbox + shorter overlay tail on dense regions
+        chunk_size=201,  # smaller chunks: tighter per-chunk bbox + shorter overlay tail on dense regions
+        max_tasks_per_child=100  # recycle workers every N chunks so memory doesn't climb to full
     )
     workflow.run_all_analyses()
