@@ -50,6 +50,7 @@ from Population_Impact import calculate_basin_population_wrapper
 from Farmland_Impact import calculate_basin_farmland_wrapper
 from Building_Impact import calculate_basin_building_wrapper
 from Road_Impact import calculate_basin_transportation_wrapper
+from tile_loader import call_with_io_retry
 
 # Basin id column for the HydroBASINS file.
 BASIN_ID = "HYBAS_ID"
@@ -120,12 +121,18 @@ class GlobalImpactWorkflow:
     """Loads the global basin file once and streams basin chunks to a pool."""
 
     def __init__(self, basin_file, config, master_output_folder,
-                 max_workers=4, chunk_size=100, max_tasks_per_child=100):
+                 max_workers=4, chunk_size=100, max_tasks_per_child=100,
+                 subfolder_digits=0):
         self.basin_file = basin_file
         self.config = config
         self.master_output = Path(master_output_folder)
         self.max_workers = max_workers
         self.chunk_size = chunk_size
+        # Bucket per-basin output files into subfolders by the first N digits of
+        # HYBAS_ID (0 = flat). At global scale a flat folder can hold hundreds
+        # of thousands of files, which strains the filesystem; 4 keeps each
+        # directory small.
+        self.subfolder_digits = subfolder_digits
         # Recycle each pool worker after this many chunks so memory that
         # geopandas/GEOS/pyarrow don't return to the OS (C-library
         # fragmentation) is released instead of climbing until the machine runs
@@ -186,7 +193,14 @@ class GlobalImpactWorkflow:
         named '<HYBAS_ID>_<suffix>.parquet' (with a covering bbox so it loads
         cleanly in QGIS). Rows with null geometry are dropped, and a basin whose
         file already exists is skipped - so an interrupted run resumes without
-        rewriting the files it already produced."""
+        rewriting the files it already produced.
+
+        Each write is wrapped in call_with_io_retry so a transient filesystem
+        resource error (e.g. Windows error 1450 when an external drive is
+        swamped by many small writes) retries after a short pause instead of
+        killing the run. If subfolder_digits > 0, files are bucketed into
+        subfolders by the first N digits of HYBAS_ID so no single directory
+        holds hundreds of thousands of files."""
         if gdf is None or len(gdf) == 0:
             return
         gdf = gdf[gdf.geometry.notna()]
@@ -195,10 +209,17 @@ class GlobalImpactWorkflow:
         out_dir = self.stats_root / folder_name
         out_dir.mkdir(exist_ok=True)
         for hid, idx in gdf.groupby(BASIN_ID).groups.items():
-            dst = out_dir / f"{hid}_{suffix}.parquet"
+            if self.subfolder_digits > 0:
+                dst_dir = out_dir / str(hid)[:self.subfolder_digits]
+                dst_dir.mkdir(exist_ok=True)
+            else:
+                dst_dir = out_dir
+            dst = dst_dir / f"{hid}_{suffix}.parquet"
             if dst.exists():
                 continue
-            gdf.loc[idx].to_parquet(dst, write_covering_bbox=True)
+            sub = gdf.loc[idx]
+            call_with_io_retry(
+                lambda s=sub, d=dst: s.to_parquet(d, write_covering_bbox=True), ())
 
     # ----- the statistics -----
     # All statistics write a FOLDER of per-basin GeoParquet files
@@ -379,24 +400,25 @@ class GlobalImpactWorkflow:
 # ===== USAGE =====
 if __name__ == "__main__":
     # Single global HUC12 HydroBASINS parquet (id column = HYBAS_ID).
-    basin_file = "/Users/maugh24/Flood_Impact_Model/HUC12.parquet"
+    basin_file = "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/Catchment/HydroBASIN/HUC12.parquet"
 
     # Folders of tiled inputs. Each impact module bbox-filters per chunk.
     config = {
         'population_source':     "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/Population/population.parquet",
         'farmland_source':       "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/ESA/bbox",
-        'building_source':       "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/OSM/Parquet_sorted",
-        'transportation_source': "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/OSM/Parquet_sorted",
+        'building_source':       "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/OSM/Parquet_sorted/Polygons",
+        'transportation_source': "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/OSM/Parquet_sorted/Lines",
     }
 
-    master_output_folder = "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Global_Impact_Results_HydroBASIN"
+    master_output_folder = "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Global_HUC12_Impact_Results"
 
     workflow = GlobalImpactWorkflow(
         basin_file=basin_file,
         config=config,
         master_output_folder=master_output_folder,
         max_workers=mp.cpu_count(),  # tune to your RAM (~3-4 GB per worker on dense chunks)
-        chunk_size=201,  # smaller chunks: tighter per-chunk bbox + shorter overlay tail on dense regions
-        max_tasks_per_child=100  # recycle workers every N chunks so memory doesn't climb to full
+        chunk_size=200,  # smaller chunks: tighter per-chunk bbox + shorter overlay tail on dense regions
+        max_tasks_per_child=100,  # recycle workers every N chunks so memory doesn't climb to full
+        subfolder_digits=4  # bucket per-basin files into subfolders (fewer files per directory)
     )
     workflow.run_all_analyses()
