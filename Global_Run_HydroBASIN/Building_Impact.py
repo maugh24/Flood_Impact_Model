@@ -52,10 +52,29 @@ def _load_buildings(building_source, bbox):
         columns=['building', 'name', 'amenity', 'geometry'],
         filters=ds.field("building").is_valid()
     )
-    folder, fallback_path = resolve_source(building_source, '*polygons*.parquet')
-    if folder is not None:
-        return read_tiles_in_bbox(folder, '*polygons*.parquet', bbox=tuple(bbox), **read_kwargs)
-    return gpd.read_parquet(fallback_path, bbox=tuple(bbox), **read_kwargs)
+    # A directory is read via the tiled reader, which globs ONLY *polygons*
+    # files - so OSM *lines* files (which have no 'building' column) are never
+    # touched, and any stray incompatible tile is skipped rather than crashing.
+    if os.path.isdir(building_source):
+        return read_tiles_in_bbox(building_source, '*polygons*.parquet', bbox=tuple(bbox), **read_kwargs)
+
+    # Single pre-merged file (legacy). Fail with a clear message if it's not
+    # actually a buildings/polygons file (e.g. building_source accidentally
+    # points at a lines file or the wrong path) instead of a cryptic Arrow error.
+    import pyarrow.parquet as _pq
+    try:
+        cols = _pq.read_schema(building_source).names
+    except Exception as e:
+        raise FileNotFoundError(
+            f"building_source is neither a folder nor a readable parquet: {building_source}"
+        ) from e
+    if 'building' not in cols:
+        raise ValueError(
+            f"building_source '{building_source}' has no 'building' column "
+            f"(this looks like a lines file, not polygons). Point building_source "
+            f"at the folder containing the *-polygons-*.parquet files."
+        )
+    return gpd.read_parquet(building_source, bbox=tuple(bbox), **read_kwargs)
 
 
 def calculate_basin_buildings(basins, building_source):

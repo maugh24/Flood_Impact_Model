@@ -32,10 +32,28 @@ def _load_transportation(transport_source, bbox):
     (Global_Run case) or a single pre-merged parquet (legacy case).
     """
     read_kwargs = dict(columns=['highway', 'railway', 'name', 'geometry'])
-    folder, fallback_path = resolve_source(transport_source, '*lines*.parquet')
-    if folder is not None:
-        return read_tiles_in_bbox(folder, '*lines*.parquet', bbox=tuple(bbox), **read_kwargs)
-    return gpd.read_parquet(fallback_path, bbox=tuple(bbox), **read_kwargs)
+    # A directory is read via the tiled reader, which globs ONLY *lines* files -
+    # so OSM *polygons* files (which have no highway/railway columns) are never
+    # touched, and any stray incompatible tile is skipped rather than crashing.
+    if os.path.isdir(transport_source):
+        return read_tiles_in_bbox(transport_source, '*lines*.parquet', bbox=tuple(bbox), **read_kwargs)
+
+    # Single pre-merged file (legacy). Fail with a clear message if it's not a
+    # lines file instead of a cryptic Arrow error deep in the read.
+    import pyarrow.parquet as _pq
+    try:
+        cols = _pq.read_schema(transport_source).names
+    except Exception as e:
+        raise FileNotFoundError(
+            f"transportation_source is neither a folder nor a readable parquet: {transport_source}"
+        ) from e
+    if 'highway' not in cols and 'railway' not in cols:
+        raise ValueError(
+            f"transportation_source '{transport_source}' has no 'highway'/'railway' column "
+            f"(this looks like a polygons file, not lines). Point transportation_source "
+            f"at the folder containing the *-lines-*.parquet files."
+        )
+    return gpd.read_parquet(transport_source, bbox=tuple(bbox), **read_kwargs)
 
 
 def calculate_basin_transportation(basins, transport_source):
