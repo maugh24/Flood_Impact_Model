@@ -7,23 +7,28 @@ those chunks in a worker pool. Each worker is handed its chunk's basins
 GeoDataFrame directly, so the 1M-row basin file is never re-read per chunk.
 Basin id column is HYBAS_ID.
 
-Results are streamed to disk chunk-by-chunk: each statistic's geometry parquet
-is written incrementally (one row group per chunk) via a ParquetWriter, and
-only the small per-basin aggregates are held in memory for the CSV. This avoids
-(a) holding every clipped geometry worldwide in memory at once and (b) Arrow's
-2 GB single-array limit that a one-shot GeoDataFrame.to_parquet hits at global
-scale.
+Each statistic writes a FOLDER of small per-basin GeoParquet files (one file per
+basin, named '<HYBAS_ID>_<type>.parquet' with a covering bbox so they load
+cleanly in QGIS) plus ONE combined summary CSV. Writing per basin as chunks
+complete keeps memory low and sidesteps Arrow's 2 GB single-array limit, and it
+means an interrupted run resumes without rewriting the basin files it already
+produced.
 
-Output layout (a single set of files - there are no VPUs here):
+Output layout (a single set of outputs - there are no VPUs here):
     master_output/
         Statistics/
-            population_statistics.{parquet,csv}
-            farmland_statistics.{parquet,csv}
-            building_statistics.{parquet,csv}
-            transportation_statistics.{parquet,csv}
+            farmland_statistics.csv           (combined summary, with a TOTAL row)
+            building_statistics.csv
+            transportation_statistics.csv
+            population_statistics.csv
+            farmland_by_basin/<HYBAS_ID>_farmland.parquet
+            building_by_basin/<HYBAS_ID>_buildings.parquet
+            transportation_by_basin/<HYBAS_ID>_roads.parquet
+            population_by_basin/<HYBAS_ID>_population.parquet
             Global_Summary.csv
 
-Per-statistic resume: a statistic whose CSV already exists is skipped.
+Per-statistic resume: a statistic whose combined CSV already exists is skipped;
+within a statistic, per-basin files that already exist are skipped too.
 """
 import io
 import time
@@ -170,13 +175,35 @@ class GlobalImpactWorkflow:
     def _args(self, source_key):
         return ((chunk, self.config[source_key]) for chunk in self._iter_chunks())
 
-    # ----- the four statistics (streamed) -----
+    def _write_per_basin(self, gdf, folder_name, suffix):
+        """Write one small GeoParquet per basin into <Statistics>/<folder_name>/,
+        named '<HYBAS_ID>_<suffix>.parquet' (with a covering bbox so it loads
+        cleanly in QGIS). Rows with null geometry are dropped, and a basin whose
+        file already exists is skipped - so an interrupted run resumes without
+        rewriting the files it already produced."""
+        if gdf is None or len(gdf) == 0:
+            return
+        gdf = gdf[gdf.geometry.notna()]
+        if len(gdf) == 0:
+            return
+        out_dir = self.stats_root / folder_name
+        out_dir.mkdir(exist_ok=True)
+        for hid, idx in gdf.groupby(BASIN_ID).groups.items():
+            dst = out_dir / f"{hid}_{suffix}.parquet"
+            if dst.exists():
+                continue
+            gdf.loc[idx].to_parquet(dst, write_covering_bbox=True)
+
+    # ----- the statistics -----
+    # All statistics write a FOLDER of per-basin GeoParquet files
+    # (<HYBAS_ID>_<type>.parquet) plus one combined summary CSV. (The
+    # already-finished global farmland parquet can also be split after the fact
+    # with split_farmland_by_basin.py.)
 
     def _run_population(self, pool):
         if self._stat_done("population_statistics.csv"):
             print("  population already done, skipping")
             return
-        writer = _GeoStreamWriter(self.stats_root / "population_statistics.parquet")
         parts = []
         for res in tqdm.tqdm(pool.imap_unordered(calculate_basin_population_wrapper,
                                                  self._args('population_source')),
@@ -184,34 +211,32 @@ class GlobalImpactWorkflow:
                              mininterval=0.5, dynamic_ncols=True):
             real = res[res['x'].notna()]
             if len(real):
-                writer.write(gpd.GeoDataFrame(
-                    real, geometry=gpd.points_from_xy(real['x'], real['y']), crs='EPSG:4326'))
+                self._write_per_basin(
+                    gpd.GeoDataFrame(real, geometry=gpd.points_from_xy(real['x'], real['y']),
+                                     crs='EPSG:4326'),
+                    "population_by_basin", "population")
             parts.append(pd.DataFrame(res).groupby(BASIN_ID, dropna=False, as_index=False)
                          ['pop_value'].sum(min_count=1))
-        writer.close()
         self._write_sum_csv(parts, 'pop_value', "population_statistics.csv")
 
     def _run_farmland(self, pool):
         if self._stat_done("farmland_statistics.csv"):
             print("  farmland already done, skipping")
             return
-        writer = _GeoStreamWriter(self.stats_root / "farmland_statistics.parquet")
         parts = []
         for res in tqdm.tqdm(pool.imap_unordered(calculate_basin_farmland_wrapper,
                                                  self._args('farmland_source')),
                              total=self.n_chunks, desc="Farmland      ",
                              mininterval=0.5, dynamic_ncols=True):
-            writer.write(res)
+            self._write_per_basin(res, "farmland_by_basin", "farmland")
             parts.append(pd.DataFrame(res.drop(columns='geometry', errors='ignore'))
                          .groupby(BASIN_ID, dropna=False, as_index=False)['area_m2'].sum(min_count=1))
-        writer.close()
         self._write_sum_csv(parts, 'area_m2', "farmland_statistics.csv")
 
     def _run_buildings(self, pool):
         if self._stat_done("building_statistics.csv"):
             print("  buildings already done, skipping")
             return
-        writer = _GeoStreamWriter(self.stats_root / "building_statistics.parquet")
         counts = []
         total = 0
         for res in tqdm.tqdm(pool.imap_unordered(calculate_basin_building_wrapper,
@@ -220,11 +245,12 @@ class GlobalImpactWorkflow:
                              mininterval=0.5, dynamic_ncols=True):
             real = res[res['building'].notna()]   # actual buildings (not empty-basin placeholders)
             if len(real):
-                writer.write(gpd.GeoDataFrame(
-                    real, geometry=gpd.points_from_xy(real['x'], real['y']), crs='EPSG:4326'))
+                self._write_per_basin(
+                    gpd.GeoDataFrame(real, geometry=gpd.points_from_xy(real['x'], real['y']),
+                                     crs='EPSG:4326'),
+                    "building_by_basin", "buildings")
                 counts.append(real.groupby(BASIN_ID).size().reset_index(name='building_count'))
                 total += len(real)
-        writer.close()
         per_basin = (pd.concat(counts, ignore_index=True) if counts
                      else pd.DataFrame({BASIN_ID: [], 'building_count': []}))
         out = pd.concat([pd.DataFrame({BASIN_ID: ['TOTAL'], 'building_count': [total]}),
@@ -235,18 +261,16 @@ class GlobalImpactWorkflow:
         if self._stat_done("transportation_statistics.csv"):
             print("  transportation already done, skipping")
             return
-        writer = _GeoStreamWriter(self.stats_root / "transportation_statistics.parquet")
         pivots = []
         for res in tqdm.tqdm(pool.imap_unordered(calculate_basin_transportation_wrapper,
                                                  self._args('transportation_source')),
                              total=self.n_chunks, desc="Transportation",
                              mininterval=0.5, dynamic_ncols=True):
-            writer.write(res)
+            self._write_per_basin(res, "transportation_by_basin", "roads")
             df = pd.DataFrame(res.drop(columns='geometry', errors='ignore'))
             if len(df):
                 pivots.append(df.groupby([BASIN_ID, 'infrastructure_type'])['length_km']
                               .sum(min_count=1).unstack('infrastructure_type'))
-        writer.close()
 
         if pivots:
             piv = pd.concat(pivots).rename(columns={'highway': 'highway_km', 'railway': 'railway_km'})

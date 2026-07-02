@@ -16,11 +16,35 @@ Two-stage filter for speed:
 import glob
 import json
 import os
+import sys
+import time
 import warnings
 
 import geopandas as gpd
 import pandas as pd
 import pyarrow.parquet as pq
+
+
+def call_with_io_retry(func, args, attempts=4, base_delay=2.0):
+    """Call func(*args), retrying on OSError (which covers PermissionError /
+    WinError 5 / FileNotFound and other transient filesystem hiccups). External
+    USB drives under many concurrent workers occasionally return a momentary
+    'access denied' or drop out for a beat; a short backoff-and-retry rides
+    over that instead of letting one blip kill a multi-hour run. If it still
+    fails after `attempts`, the last error is re-raised so genuine problems
+    (bad path, drive truly gone) still surface."""
+    last = None
+    for i in range(attempts):
+        try:
+            return func(*args)
+        except OSError as e:
+            last = e
+            if i < attempts - 1:
+                print(f"[io-retry] {type(e).__name__} on attempt {i+1}/{attempts}: "
+                      f"{str(e)[:120]} - retrying in {base_delay*(i+1):.0f}s",
+                      file=sys.stderr, flush=True)
+                time.sleep(base_delay * (i + 1))
+    raise last
 
 
 # Module-level caches. Under multiprocessing each pool worker is a separate

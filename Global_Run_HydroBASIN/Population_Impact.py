@@ -2,7 +2,7 @@ import os
 import geopandas as gpd
 import pandas as pd
 
-from tile_loader import read_tiles_in_bbox, resolve_source
+from tile_loader import read_tiles_in_bbox, resolve_source, call_with_io_retry
 
 # Basin id column. HydroBASINS uses HYBAS_ID (TDX used LINKNO).
 BASIN_ID = "HYBAS_ID"
@@ -95,7 +95,7 @@ def calculate_basin_population(basins, population_source):
 
 
 def calculate_basin_population_wrapper(args):
-    return calculate_basin_population(*args)
+    return call_with_io_retry(calculate_basin_population, args)
 
 
 def aggregate_population_for_csv(population_result):

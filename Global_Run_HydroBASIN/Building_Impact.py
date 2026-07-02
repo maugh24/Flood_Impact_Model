@@ -3,7 +3,7 @@ import geopandas as gpd
 import pandas as pd
 import pyarrow.dataset as ds
 
-from tile_loader import read_tiles_in_bbox, resolve_source
+from tile_loader import read_tiles_in_bbox, resolve_source, call_with_io_retry
 
 # Basin id column. HydroBASINS uses HYBAS_ID (TDX used LINKNO).
 BASIN_ID = "HYBAS_ID"
@@ -141,4 +141,4 @@ def calculate_basin_buildings(basins, building_source):
 
 
 def calculate_basin_building_wrapper(args):
-    return calculate_basin_buildings(*args)
+    return call_with_io_retry(calculate_basin_buildings, args)
