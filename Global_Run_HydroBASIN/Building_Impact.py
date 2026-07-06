@@ -1,9 +1,11 @@
 import os
+import json
 import geopandas as gpd
 import pandas as pd
-import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+import pyarrow.compute as pc
 
-from tile_loader import read_tiles_in_bbox, resolve_source
+from tile_loader import _glob_files, _file_bbox, _bboxes_overlap
 
 BASIN_ID = "HYBAS_ID"
 
@@ -28,6 +30,9 @@ _BUILDING_VALUES = [
     'triumphal_arch', 'windmill'
 ]
 
+_EMPTY_CENTERS = gpd.GeoDataFrame({'building': [], 'name': [], 'amenity': []},
+                                  geometry=[], crs='EPSG:4326')
+
 
 def _empty_result(ids):
     return pd.DataFrame(data={
@@ -40,27 +45,84 @@ def _empty_result(ids):
     })
 
 
-def _load_buildings(building_source, bbox):
-    read_kwargs = dict(
-        columns=['building', 'name', 'amenity', 'geometry'],
-        filters=ds.field("building").is_valid()
-    )
-    if os.path.isdir(building_source):
-        return read_tiles_in_bbox(building_source, '*polygons*.parquet', bbox=tuple(bbox), **read_kwargs)
+def _covering_col(path):
+    """Name of the GeoParquet covering bbox column ('bbox' or 'geometry_bbox')."""
+    kv = pq.read_metadata(path).metadata or {}
+    if b'geo' not in kv:
+        return None
+    geo = json.loads(kv[b'geo'])
+    primary = geo.get('primary_column', 'geometry')
+    cov = geo.get('columns', {}).get(primary, {}).get('covering', {}).get('bbox')
+    return cov['xmin'][0] if cov else None
 
-    import pyarrow.parquet as _pq
-    try:
-        cols = _pq.read_schema(building_source).names
-    except Exception as e:
-        raise FileNotFoundError(
-            f"building_source is neither a folder nor a readable parquet: {building_source}"
-        ) from e
-    if 'building' not in cols:
-        raise ValueError(
-            f"building_source '{building_source}' has no 'building' column "
-            f"(looks like a lines file). Point it at the folder of *-polygons-*.parquet files."
-        )
-    return gpd.read_parquet(building_source, bbox=tuple(bbox), **read_kwargs)
+
+def _read_centers(path, bbox):
+    """Read building centroids inside bbox from one polygon tile using ONLY the
+    covering bbox column (center of each building's bbox) - the heavy polygon
+    geometry column is never read. Falls back to true centroids if a file has
+    no covering bbox."""
+    names = pq.read_schema(path).names
+    if 'building' not in names:
+        return _EMPTY_CENTERS
+    col = _covering_col(path)
+    if col is None:
+        return _read_geometry_centroids(path, bbox)
+
+    minx, miny, maxx, maxy = bbox
+    cols = [c for c in ('building', 'name', 'amenity') if c in names] + [col]
+    filt = ((pc.field(col, 'xmax') >= minx) & (pc.field(col, 'xmin') <= maxx) &
+            (pc.field(col, 'ymax') >= miny) & (pc.field(col, 'ymin') <= maxy) &
+            pc.field('building').isin(_BUILDING_VALUES))
+    t = pq.read_table(path, columns=cols, filters=filt)
+    if t.num_rows == 0:
+        return _EMPTY_CENTERS
+
+    bbc = t.column(col)
+    cx = (pc.struct_field(bbc, 'xmin').to_numpy(zero_copy_only=False) +
+          pc.struct_field(bbc, 'xmax').to_numpy(zero_copy_only=False)) / 2.0
+    cy = (pc.struct_field(bbc, 'ymin').to_numpy(zero_copy_only=False) +
+          pc.struct_field(bbc, 'ymax').to_numpy(zero_copy_only=False)) / 2.0
+    data = {c: (t.column(c).to_pandas() if c in names else [None] * t.num_rows)
+            for c in ('building', 'name', 'amenity')}
+    return gpd.GeoDataFrame(data, geometry=gpd.points_from_xy(cx, cy), crs='EPSG:4326')
+
+
+def _read_geometry_centroids(path, bbox):
+    """Fallback for a tile with no covering bbox: read the polygons and use true
+    centroids."""
+    g = gpd.read_parquet(path, bbox=tuple(bbox), columns=['building', 'name', 'amenity', 'geometry'])
+    if len(g) == 0 or 'building' not in g.columns:
+        return _EMPTY_CENTERS
+    g = g[g['building'].isin(_BUILDING_VALUES)]
+    if len(g) == 0:
+        return _EMPTY_CENTERS
+    return g.set_geometry(g.geometry.centroid)[['building', 'name', 'amenity', 'geometry']]
+
+
+def _load_buildings(building_source, bbox):
+    bbox = tuple(bbox)
+    if os.path.isdir(building_source):
+        files = _glob_files(building_source, '*polygons*.parquet')
+    else:
+        if 'building' not in pq.read_schema(building_source).names:
+            raise ValueError(
+                f"building_source '{building_source}' has no 'building' column "
+                f"(looks like a lines file). Point it at the *-polygons-*.parquet folder/file."
+            )
+        files = [building_source]
+
+    frames = []
+    for f in files:
+        fb = _file_bbox(f)
+        if fb is not None and not _bboxes_overlap(fb, bbox):
+            continue
+        g = _read_centers(f, bbox)
+        if len(g):
+            frames.append(g)
+
+    if not frames:
+        return _EMPTY_CENTERS
+    return gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs='EPSG:4326')
 
 
 def calculate_basin_buildings(basins, building_source):
@@ -70,19 +132,13 @@ def calculate_basin_buildings(basins, building_source):
     basins = basins[[BASIN_ID, 'geometry']]
     ids = basins[BASIN_ID].tolist()
 
+    # Buildings arrive as centroid points (from the covering bbox center).
     buildings = _load_buildings(building_source, basins.total_bounds)
-    if len(buildings) == 0 or 'building' not in buildings.columns:
-        return _empty_result(ids)
-
-    buildings = buildings[buildings['building'].isin(_BUILDING_VALUES)]
     if len(buildings) == 0:
         return _empty_result(ids)
 
     if buildings.crs != basins.crs:
         buildings = buildings.to_crs(basins.crs)
-
-    # Assign each building to the basin its centroid falls in.
-    buildings = buildings.set_geometry(buildings.geometry.centroid)
 
     buildings_in_basins = gpd.sjoin(buildings, basins[[BASIN_ID, 'geometry']],
                                     how='inner', predicate='within')
