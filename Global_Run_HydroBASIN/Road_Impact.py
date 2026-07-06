@@ -2,6 +2,7 @@ import os
 import geopandas as gpd
 import pandas as pd
 import numpy as np
+import pyarrow.dataset as ds
 
 from tile_loader import read_tiles_in_bbox, resolve_source
 
@@ -24,7 +25,10 @@ def _empty_result():
 
 
 def _load_transportation(transport_source, bbox):
-    read_kwargs = dict(columns=['highway', 'railway', 'name', 'geometry'])
+    # Only materialize roads/rail we keep - the type filter is pushed into the
+    # read so geometry for waterways, barriers, and unwanted road types isn't loaded.
+    filt = ds.field('highway').isin(_HIGHWAY_VALUES) | ds.field('railway').isin(_RAILWAY_VALUES)
+    read_kwargs = dict(columns=['highway', 'railway', 'name', 'geometry'], filters=filt)
     if os.path.isdir(transport_source):
         return read_tiles_in_bbox(transport_source, '*lines*.parquet', bbox=tuple(bbox), **read_kwargs)
 
