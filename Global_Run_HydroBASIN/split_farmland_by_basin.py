@@ -10,8 +10,8 @@ import pyarrow.parquet as pq
 import tqdm
 
 
-INPUT_PARQUET = r"D:\Brian\Flood_Impact_Model\Global_HUC12_Impact_Results\Statistics\farmland_statistics.parquet"
-OUTPUT_DIR    = r"D:\Brian\Flood_Impact_Model\Global_HUC12_Impact_Results\Statistics\farmland_by_basin"
+INPUT_PARQUET = r"/Users/maugh24/Flood_Impact_Model/Global_HUC12_Impact_Results/Statistics/farmland_statistics.parquet"
+OUTPUT_DIR    = r"/Users/maugh24/Flood_Impact_Model/Global_HUC12_Impact_Results/Statistics/farmland_by_basin"
 
 ID_COL = "HYBAS_ID"
 WRITE_COVERING_BBOX = True
