@@ -62,7 +62,7 @@ class GlobalImpactWorkflow:
         self.chunk_size = chunk_size
 
         self.master_output.mkdir(parents=True, exist_ok=True)
-        self.stats_root = self.master_output / "Statistics"
+        self.stats_root = self.master_output / "Statistics_fix"
         self.stats_root.mkdir(exist_ok=True)
 
         self.basins = None
@@ -269,7 +269,7 @@ class GlobalImpactWorkflow:
 
         start = time.time()
         with mp.Pool(processes=self.max_workers) as pool:
-            # self._run_population(pool)   # disabled
+            self._run_population(pool)
             self._run_farmland(pool)
             self._run_buildings(pool)
             self._run_transportation(pool)
@@ -285,22 +285,23 @@ class GlobalImpactWorkflow:
 
 
 if __name__ == "__main__":
-    basin_file = "/Users/maugh24/Flood_Impact_Model/HUC12.parquet"
+    basin_file = r"D:\Brian\Flood_Impact_Model\Files\Catchment\HydroBASIN\HUC12.parquet"
 
+    # Folders of tiled inputs. Each impact module bbox-filters per basin chunk.
     config = {
-        'population_source':     "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/Population/population.parquet",
-        'farmland_source':       "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/ESA/bbox",
-        'building_source':       "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/OSM/Parquet_sorted",
-        'transportation_source': "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/OSM/Parquet_sorted",
+        'population_source': r"D:\Brian\Flood_Impact_Model\Files\Population\population.parquet",
+        'farmland_source': r"D:\Brian\Flood_Impact_Model\Files\ESA\bbox",
+        'building_source': r"C:\Users\maugh24\Flood_Impact_Model\Files\OSM\Parquet_sorted\Polygons",
+        'transportation_source': r"C:\Users\maugh24\Flood_Impact_Model\Files\OSM\Parquet_sorted\Lines",
     }
 
-    master_output_folder = "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Global_Impact_Results_HydroBASIN"
+    master_output_folder = r"C:\Users\maugh24\Flood_Impact_Model\Global_HUC12_Impact_Results"
 
     workflow = GlobalImpactWorkflow(
         basin_file=basin_file,
         config=config,
         master_output_folder=master_output_folder,
         max_workers=mp.cpu_count(),
-        chunk_size=200
+        chunk_size=50
     )
     workflow.run_all_analyses()

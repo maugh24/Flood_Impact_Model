@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.lprof
+mprofile_*.dat
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+._*
+
+# Data never belongs in the repo (inputs/outputs live outside Flood_Impact_Code)
+*.parquet
+*.parquet.partial
+*.osm.pbf
+*.gpkg
+*.tif
+*.csv
+*.geojson
+*.sha256

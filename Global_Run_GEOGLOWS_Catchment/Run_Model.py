@@ -306,23 +306,23 @@ class GlobalImpactWorkflow:
 # ===== USAGE =====
 if __name__ == "__main__":
     # Folder containing vpu=NNN/catchments_NNN.parquet (Hive partitioned)
-    catchments_folder = "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/Catchment/GEOGLOW_Catchments"
+    catchments_folder = r"D:\Brian\Flood_Impact_Model\Files\Catchment\GEOGLOW_Catchments"
 
     # Folders of tiled inputs. Each impact module bbox-filters per basin chunk.
     config = {
-        'population_source':     "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/Population/population.parquet",
-        'farmland_source':       "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/ESA/bbox",
-        'building_source':       "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/OSM/Parquet_sorted",
-        'transportation_source': "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Files/OSM/Parquet_sorted",
+        'population_source':     r"D:\Brian\Flood_Impact_Model\Files\Population\population.parquet",
+        'farmland_source':       r"D:\Brian\Flood_Impact_Model\Files\ESA\bbox",
+        'building_source':       r"D:\Brian\Flood_Impact_Model\Files\OSM\Parquet_sorted",
+        'transportation_source': r"D:\Brian\Flood_Impact_Model\Files\OSM\Parquet_sorted",
     }
 
-    master_output_folder = "/Volumes/LAB_4TB/Brian/Flood_Impact_Model/Global_Impact_Results"
+    master_output_folder = r"D:\Brian\Flood_Impact_Model\Global_Impact_Results"
 
     workflow = GlobalImpactWorkflow(
         catchments_folder=catchments_folder,
         config=config,
         master_output_folder=master_output_folder,
-        max_workers=mp.cpu_count() // 4,  # tune to your RAM (~3-4 GB per worker on big VPUs)
+        max_workers= mp.cpu_count(),  # out 32 on big computer. tune to your RAM (~3-4 GB per worker on big VPUs)
         chunk_size=100
     )
     workflow.run_all_analyses()
