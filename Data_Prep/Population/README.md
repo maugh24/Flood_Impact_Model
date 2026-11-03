@@ -24,4 +24,4 @@ If the download fails, the script prints where to put a manually downloaded file
 Set `POPULATION_YEAR` in `Impact_Intersection/config.py` to the same year.
 
 Tested on the 2025 raster: 51.2 M populated pixels, 8,196,931,816 people, 612 MB, ~70 s.
-The old pixel-polygon script is in `Legacy/`.
+The old pixel-polygon script is in `Archive/Data_Prep_Legacy/Population/`.

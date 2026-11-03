@@ -14,16 +14,11 @@ To update an existing environment after `environment.yml` changes:
 ## Layout
 | Folder | What it is |
 |---|---|
-| `Impact_Intersection/` | **Current run.** `./run_impact.sh <aoi>` sums exposure over H3 cells, GEOGLOWS catchments, HydroBASINS or any prepared polygon set -> one CSV for FEWS4All |
-| `Single_extent/` | Impact inside one flood-extent polygon |
-| `Multiple_Return_Periods/` | Impact for several areas x return-period flood extents |
-| `Data_Prep/OSM/` | **Current OSM prep pipeline** (`osm_prep.sh`): Geofabrik .pbf -> filtered, sorted GeoParquet |
-| `Data_Prep/AOI/` | `prepare_aoi.py`: any polygon set -> AOI file for `Impact_Intersection` |
-| `Data_Prep/OSM/Legacy/` | Old OSM steps (bbox scripts, DuckDB Hilbert sort, schema check) replaced by `osm_prep.sh` |
-| `Data_Prep/Population/` | **Current population prep** (`population_prep.sh`): downloads WorldPop 1 km raster if missing -> population points (old script in `Legacy/`) |
-| `Data_Prep/Farmland/` | **Current farmland prep** (`farmland_prep.sh`): ESA WorldCover tiles -> cropland blocks (old polygon scripts in `Legacy/`) |
-| `Data_Prep/Flood_Extent/` | Flood-extent rasters -> parquet |
-| `Data_Prep/Open_Buildings/` | Google Open Buildings CSV -> parquet, flood intersect |
-| `Archive/` | Superseded code kept for reference: the old per-catchment and per-HydroBASIN global runs, per-dataset scripts, profiling output |
+| `Impact_Intersection/` | **The run.** `./run_impact.sh <aoi> [level]` sums exposure over H3 cells, GEOGLOWS catchments, HydroBASINS or any prepared polygon set -> one CSV for FEWS4All |
+| `Data_Prep/OSM/` | `osm_prep.sh`: Geofabrik .pbf -> filtered, sorted GeoParquet (buildings, roads/rail, bridges, dams) |
+| `Data_Prep/Farmland/` | `farmland_prep.sh`: ESA WorldCover tiles -> cropland blocks |
+| `Data_Prep/Population/` | `population_prep.sh`: WorldPop 1 km raster -> population points |
+| `Data_Prep/AOI/` | `aoi_prep.py` (GEOGLOWS, HydroBASINS; used automatically) and `prepare_aoi.py` (any other polygon set) |
+| `Archive/` | Superseded code kept for reference: old global runs (per catchment, per HydroBASIN), single-extent and return-period runs, and the old data-prep scripts (`Data_Prep_Legacy/`: OSM bbox/sort, polygon farmland, pixel-polygon population, flood-extent rasters, Open Buildings) |
 
 Each folder with a README explains how to run it.

@@ -30,7 +30,7 @@ Rerunning skips finished tiles. A log of each run is saved in `logs/`.
 (cropland area in the block, WGS84 ellipsoid), `bbox`. Tiles without cropland get an empty file.
 
 ## Why blocks instead of polygons
-The old process (`Legacy/`) traced cropland into polygons, simplified them by 10 m and dropped
+The old process (now in `Archive/Data_Prep_Legacy/Farmland/`) traced cropland into polygons, simplified them by 10 m and dropped
 any under 500 m^2. On tile N21W081 that lost 1.0% of the farmland; the blocks keep all of it
 (they match an independent pixel count to 0.02 km^2 of 3,092 km^2) and take ~5 s per tile.
 The cost: at an AOI border a block's area goes to the AOI holding its centre.
@@ -41,5 +41,5 @@ The cost: at an AOI border a block's area goes to the AOI holding its centre.
 | 15 px (~150 m, default) | 1.0% / 6.9% | ~20 GB |
 | 10 px (~100 m) | 0.5% / 3.5% | ~35-40 GB |
 
-`Legacy/` holds the old polygon scripts. `Impact_Intersection` still reads the old polygon
+The old polygon scripts are in `Archive/Data_Prep_Legacy/Farmland/`. `Impact_Intersection` still reads the old polygon
 chunks too, if `INPUTS["farmland"]` in its `config.py` points at them.
