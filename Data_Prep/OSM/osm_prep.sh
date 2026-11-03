@@ -14,6 +14,10 @@
 # Usage (from this folder, in the hydroinformatics environment):
 #   ./osm_prep.sh                      # all regions in REGIONS below
 #   ./osm_prep.sh central-america      # just one (or several) regions
+#   ./osm_prep.sh /path/to/asia-261029.osm.pbf
+#                                      # a .pbf you already have (no download);
+#                                      # outputs are named after the file:
+#                                      # asia-261029-lines.parquet, ...
 #   DRY_RUN=1 ./osm_prep.sh asia       # print the commands, run nothing
 #
 # Safe to rerun: finished steps are skipped.
@@ -31,9 +35,10 @@ set -euo pipefail
 REGIONS="africa antarctica asia australia-oceania central-america europe north-america south-america"
 
 # Everything this script writes goes under WORK_DIR:
-#   pbf/       downloaded .osm.pbf files (kept so a rerun needn't re-download)
 #   Lines/     <region>-lines.parquet      <- point the H3 config's OSM_ROOT here
 #   Polygons/  <region>-polygons.parquet
+#   Points/    <region>-points.parquet     (dams/weirs mapped as single points)
+#   pbf/       downloads, deleted once a region is finished (see KEEP_PBF)
 #   tmp/       GDAL scratch space (can reach tens of GB for europe/asia)
 WORK_DIR="${WORK_DIR:-/Users/maugh24/Flood_Impact_Model/Files/OSM_Prep}"
 
@@ -41,14 +46,27 @@ WORK_DIR="${WORK_DIR:-/Users/maugh24/Flood_Impact_Model/Files/OSM_Prep}"
 # Bigger = faster on large regions. Keep it well under your RAM.
 OSM_TMP_MB=4000
 
+# 0 = delete a region's downloaded .pbf (and .md5) once all its layers are
+#     converted and validated, to save disk. 1 = keep it.
+#     A .pbf you pass in as a file path is never deleted.
+KEEP_PBF="${KEEP_PBF:-0}"
+
+# YES = sort features by location (fast bbox reads for the catchment runs and
+# QGIS; GDAL writes an uncompressed temporary copy, which needs a lot of disk
+# for Asia/Europe). NO = no temporary copy; the H3 run gives identical results.
+SORT_BY_BBOX="${SORT_BY_BBOX:-YES}"
+
 GEOFABRIK_URL="https://download.geofabrik.de"
 PYTHON="${PYTHON:-python}"   # use $PYTHON if already set, otherwise "python"
 
-# Features kept - the same lists the H3 impact code counts.
+# Features kept. Roads/rail are the same lists the H3 impact code counts;
+# road/rail segments keep their bridge=* tag (bridge=yes, viaduct, ...).
 HIGHWAYS="'motorway','trunk','primary','secondary','tertiary','residential','motorway_link','trunk_link','primary_link','secondary_link','tertiary_link','living_street','busway','footway','cycleway'"
 RAILWAYS="'light_rail','monorail','rail','subway','tram'"
-LINES_WHERE="highway IN (${HIGHWAYS}) OR railway IN (${RAILWAYS})"
-POLYGONS_WHERE="building IS NOT NULL"
+DAMS="'dam','weir','check_dam'"          # waterway=* values
+LINES_WHERE="highway IN (${HIGHWAYS}) OR railway IN (${RAILWAYS}) OR waterway IN (${DAMS})"
+POLYGONS_WHERE="building IS NOT NULL OR waterway IN (${DAMS})"
+POINTS_WHERE="waterway IN (${DAMS})"
 
 # ----------------------------------------------------------------------------
 # Derived paths (no need to edit)
@@ -131,10 +149,10 @@ download_region() {
 # ----------------------------------------------------------------------------
 # Steps 2-4: convert, validate, checksum one layer
 # ----------------------------------------------------------------------------
-# convert_layer REGION OSM_LAYER WHERE OUT_FOLDER OUT_SUFFIX
+# convert_layer NAME PBF OSM_LAYER WHERE OUT_FOLDER OUT_SUFFIX
+#   NAME is used for log messages and the output file name.
 convert_layer() {
-    local region="$1" layer="$2" where="$3" folder="$4" suffix="$5"
-    local pbf="$PBF_DIR/$region-latest.osm.pbf"
+    local region="$1" pbf="$2" layer="$3" where="$4" folder="$5" suffix="$6"
     local out="$WORK_DIR/$folder/$region-$suffix.parquet"
     local partial="$out.partial"      # not *.parquet, so the H3 run never picks it up
 
@@ -144,7 +162,9 @@ convert_layer() {
     fi
 
     log "$region/$layer: converting -> $out"
-    rm -f "$partial"
+    # Clear leftovers from a failed earlier run, including GDAL's temporary
+    # sort file and its SQLite journal (a stale journal can corrupt the new one).
+    rm -f "$partial" "$partial".tmp.gpkg*
     # -oo  = options for READING the .pbf     -lco = options for WRITING the parquet
     run ogr2ogr -f Parquet "$partial" "$pbf" "$layer" \
         -oo CONFIG_FILE="$OSM_CONFIG" \
@@ -152,7 +172,7 @@ convert_layer() {
         -where "$where" \
         -lco GEOMETRY_NAME=geometry \
         -lco WRITE_COVERING_BBOX=YES \
-        -lco SORT_BY_BBOX=YES \
+        -lco SORT_BY_BBOX="$SORT_BY_BBOX" \
         -lco ROW_GROUP_SIZE=100000 \
         -lco COMPRESSION=ZSTD \
         -progress
@@ -180,13 +200,47 @@ for tool in ogr2ogr curl shasum "$PYTHON"; do
 done
 [[ -f "$OSM_CONFIG" ]] || { echo "Missing $OSM_CONFIG"; exit 1; }
 
-mkdir -p "$PBF_DIR" "$TMP_DIR" "$WORK_DIR/Lines" "$WORK_DIR/Polygons"
+# GDAL must be able to READ OpenStreetMap and WRITE Parquet. The list is saved
+# in a variable first (rather than piped into grep) because `set -o pipefail`
+# would treat grep closing the pipe early as a failure.
+formats="$(ogrinfo --formats)"
+if [[ "$formats" != *"OSM -vector-"* || "$formats" != *"Parquet -vector-"* ]]; then
+    echo "This GDAL ($(command -v ogr2ogr)) is missing a driver it needs:"
+    echo "$formats" | grep -i -E "osm|parquet" || true
+    echo "Need both an 'OSM -vector-' and a 'Parquet -vector-' line above."
+    echo "Fix (conda):  conda install -c conda-forge libgdal-arrow-parquet"
+    exit 1
+fi
+
+mkdir -p "$PBF_DIR" "$TMP_DIR" "$WORK_DIR/Lines" "$WORK_DIR/Polygons" "$WORK_DIR/Points"
 
 log "OSM prep -> $WORK_DIR"
 log "regions: $regions"
-for region in $regions; do
-    download_region "$region"
-    convert_layer "$region" lines         "$LINES_WHERE"    Lines    lines
-    convert_layer "$region" multipolygons "$POLYGONS_WHERE" Polygons polygons
+for item in $regions; do
+    if [[ "$item" == *.pbf ]]; then
+        # A file path: skip the download and name outputs after the file,
+        # e.g. /x/asia-261029.osm.pbf -> name "asia-261029".
+        [[ -f "$item" ]] || { echo "File not found: $item"; exit 1; }
+        pbf="$item"
+        name="$(basename "$item")"
+        name="${name%.pbf}"     # strip ".pbf" from the end
+        name="${name%.osm}"     # then ".osm"
+        log "$name: using $pbf"
+    else
+        name="$item"
+        download_region "$name"
+        pbf="$PBF_DIR/$name-latest.osm.pbf"
+    fi
+    convert_layer "$name" "$pbf" lines         "$LINES_WHERE"    Lines    lines
+    convert_layer "$name" "$pbf" multipolygons "$POLYGONS_WHERE" Polygons polygons
+    convert_layer "$name" "$pbf" points        "$POINTS_WHERE"   Points   points
+
+    # Every layer of this region is converted and validated (set -e would
+    # have stopped the script otherwise), so the download can go.
+    if [[ "$KEEP_PBF" != "1" && "$item" != *.pbf ]]; then
+        log "$name: deleting $pbf to save space (set KEEP_PBF=1 to keep it)"
+        run rm -f "$pbf" "$pbf.md5"
+    fi
+    rm -rf "${TMP_DIR:?}"/*      # GDAL scratch from this region
 done
 log "all done"

@@ -1,0 +1,8 @@
+h3>=4.1
+shapely>=2.0
+pyarrow>=14
+numpy
+pandas
+pyproj
+geopandas>=1.0     # only for Data_Prep/AOI/prepare_aoi.py
+tqdm

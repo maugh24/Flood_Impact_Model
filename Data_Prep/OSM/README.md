@@ -23,17 +23,34 @@ chmod +x osm_prep.sh                 # once: allow the file to be run as a progr
 DRY_RUN=1 ./osm_prep.sh antarctica   # print the commands only
 ./osm_prep.sh antarctica             # smallest region (~30 MB) as a first real test
 ./osm_prep.sh                        # all regions in REGIONS
+./osm_prep.sh /path/to/asia-261029.osm.pbf   # a .pbf you already have (no download)
 ```
-Rerunning skips finished downloads and conversions. Output goes to `WORK_DIR`
-(default `Files/OSM_Prep`): `Lines/`, `Polygons/`, `pbf/`, `tmp/`.
+A file path skips the download and MD5 check; outputs are named after the file
+(`asia-261029-lines.parquet`, `asia-261029-polygons.parquet`).
+Rerunning skips finished conversions. Output goes to `WORK_DIR`
+(default `Files/OSM_Prep`, override with `WORK_DIR=/path ./osm_prep.sh ...`):
+`Lines/`, `Polygons/`, `Points/`. Only these GeoParquet files are kept: each region's
+downloaded `.pbf` is deleted once all three layers are converted and validated
+(`KEEP_PBF=1` keeps it; a `.pbf` you pass as a file path is never deleted), and
+GDAL's `tmp/` scratch is emptied after each region.
+
+`SORT_BY_BBOX=NO ./osm_prep.sh ...` skips the spatial sort. Results of the H3 run are
+identical either way; sorting only speeds up small-area reads (catchment runs, QGIS),
+but it makes GDAL write a large uncompressed temporary copy (Asia buildings filled a
+~70 GB disk).
 
 ## Output
 | Layer | Kept | Columns |
 |---|---|---|
-| `Lines/<region>-lines.parquet` | highway in (motorway ... cycleway) or railway in (rail, light_rail, subway, monorail, tram) | osm_id, name, highway, railway, z_order, geometry, geometry_bbox |
-| `Polygons/<region>-polygons.parquet` | building is not null | osm_id, osm_way_id, name, building, amenity, geometry, geometry_bbox |
+| `Lines/<region>-lines.parquet` | highway in (motorway ... cycleway), railway in (rail, light_rail, subway, monorail, tram), waterway in (dam, weir, check_dam) | osm_id, name, highway, railway, bridge, waterway, z_order, geometry, geometry_bbox |
+| `Polygons/<region>-polygons.parquet` | building is not null, or waterway in (dam, weir, check_dam) | osm_id, osm_way_id, name, building, amenity, waterway, geometry, geometry_bbox |
+| `Points/<region>-points.parquet` | waterway in (dam, weir, check_dam) (dams mapped as a single point) | osm_id, name, waterway, geometry, geometry_bbox |
 
-The road/rail lists match `Global_Run_H3_Cells/h3_impact.py`; change both together.
+`bridge` holds OSM's bridge tag on road/rail segments (`yes`, `viaduct`, `cantilever`, ...);
+it is empty for segments that are not bridges. Bridges and dams are kept whether or not
+they cross a river. The road/rail lists match `Global_Run_H3_Cells/h3_impact.py`; change
+both together. Dam rows have no `building`/`highway`/`railway` value, so the current H3
+run ignores them.
 
 ## Checking copies
 Each output has a `.sha256` beside it. After copying a folder anywhere:

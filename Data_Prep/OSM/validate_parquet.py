@@ -43,8 +43,7 @@ def check_file(path):
         crs = col.get("crs", "missing")        # missing key = OGC:CRS84 (lon/lat)
         if isinstance(crs, dict) and crs.get("type") not in ("GeographicCRS", None):
             problems.append(f"CRS is not lon/lat: {crs.get('name')}")
-    if md.num_rows == 0:
-        problems.append("file has 0 rows")
+    # 0 rows is allowed: a small region can have no dams, for example.
 
     for rg in range(md.num_row_groups):
         for c in names:
@@ -78,8 +77,9 @@ def main(args):
                 print(f"        - {p}")
         else:
             md = pq.read_metadata(f)
+            note = "  (EMPTY - no features matched)" if md.num_rows == 0 else ""
             print(f"OK    {f}  ({md.num_rows:,} rows, {md.num_row_groups} row groups, "
-                  f"{time.time() - t0:.0f}s)")
+                  f"{time.time() - t0:.0f}s){note}")
     print(f"{len(files) - bad}/{len(files)} file(s) OK")
     return 1 if bad else 0
 

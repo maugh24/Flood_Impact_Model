@@ -1,15 +1,21 @@
 """
-Core per-task logic: read one batch of row groups from a prepped GeoParquet,
-assign every feature (or piece of a feature) to an H3 cell, and return a small
-per-cell aggregate table.
+Layer processors: read one batch of row groups from a prepped GeoParquet,
+assign every feature (or piece of a feature) to an area of interest (AOI),
+and return a small per-AOI aggregate table.
 
-No polygon overlays against AOIs are done. H3 is used as an index:
-  population  pixel polygon bbox centre -> cell, sum pop_value
-  buildings   footprint bbox centre     -> cell, count
-  farmland    small polygons: bbox centre -> cell, sum geodesic-ish area
-              large polygons: clipped exactly to the overlapping H3 cells
-  roads       lines densified, each segment's midpoint -> cell, sum length
-              (roads + railways combined into transportation_km)
+The AOI (H3 cells or a polygon set, see aoi.py) is passed in as `a`; this
+file only decides what point or piece of each feature is assigned:
+  population  pixel polygon bbox centre -> AOI, sum pop_value
+  buildings   footprint bbox centre     -> AOI, count
+  farmland    cropland blocks (Data_Prep/Farmland/farmland_prep.py): block
+              centre -> AOI, sum area_m2
+              older polygon files: small polygons by bbox centre, large ones
+              clipped exactly to the overlapping AOIs
+  roads       lines densified, each segment's midpoint -> AOI, sum length
+              (roads + railways combined into transportation_km); road/rail
+              segments tagged bridge=* also counted (bbox centre -> AOI)
+  dams        waterway=dam / weir / check_dam from the Lines, Polygons and
+              Points files, bbox centre -> AOI, count
 
 All functions are top-level so they pickle for multiprocessing on Windows.
 """
@@ -23,11 +29,11 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import shapely
-from h3.api import basic_int as h3i
 
-# Authalic sphere radius (m) - same as H3's own area calculations.
+from aoi import lonlat_area_m2
+
+# Authalic sphere radius (m), used for road-segment lengths.
 EARTH_R = 6371007.180918475
-DEG2M = EARTH_R * math.pi / 180.0
 
 # ---------------------------------------------------------------------------
 # Feature classes (kept consistent with the catchment pipeline)
@@ -57,73 +63,38 @@ MAJOR_ROADS = ['motorway', 'trunk', 'primary',
 MINOR_ROADS = ['secondary', 'tertiary', 'residential', 'secondary_link',
                'tertiary_link', 'living_street', 'busway', 'footway', 'cycleway']
 RAILWAYS = ['light_rail', 'monorail', 'rail', 'subway', 'tram']
+DAMS = ['dam']                      # waterway=* values counted as dams
+WEIRS = ['weir', 'check_dam']       # smaller barriers, counted separately
 
 # Output columns produced by each layer.
 LAYER_COLUMNS = {
     "population": ["population"],
     "buildings":  ["buildings"],
     "farmland":   ["farmland_km2"],
-    "roads":      ["transportation_km"],
+    "roads":      ["transportation_km", "bridges"],
+    "dams":       ["dams", "weirs"],
 }
 
 
 # ---------------------------------------------------------------------------
-# H3 helpers
+# Aggregation
 # ---------------------------------------------------------------------------
-def latlng_to_cells(lat, lng, res):
-    """Vector of uint64 H3 cells for arrays of lat/lng (degrees)."""
-    f = h3i.latlng_to_cell
-    lat, lng = np.asarray(lat, float), np.asarray(lng, float)
-    out = np.empty(len(lat), dtype=np.uint64)
-    step = 500_000                                 # bounded Python-object memory
-    for i in range(0, len(lat), step):
-        la, ln = lat[i:i + step].tolist(), lng[i:i + step].tolist()
-        out[i:i + step] = np.fromiter((f(a, b, res) for a, b in zip(la, ln)),
-                                      dtype=np.uint64, count=len(la))
-    return out
-
-
-def sum_by_cell(cells, **values):
-    """Group equal cells and sum each value array -> DataFrame(h3, *values)."""
-    if len(cells) == 0:
-        return pd.DataFrame({'h3': np.array([], dtype=np.uint64),
+def sum_by_aoi(ids, **values):
+    """Group equal AOI ids and sum each value array -> DataFrame(aoi, *values).
+    Ids of -1 (not inside any AOI) are dropped."""
+    ids = np.asarray(ids, dtype=np.int64)
+    keep = ids >= 0
+    if not keep.all():
+        ids = ids[keep]
+        values = {k: np.asarray(v, dtype=float)[keep] for k, v in values.items()}
+    if len(ids) == 0:
+        return pd.DataFrame({'aoi': np.array([], dtype=np.int64),
                              **{k: np.array([], dtype=float) for k in values}})
-    uniq, inv = np.unique(cells, return_inverse=True)
-    out = {'h3': uniq}
+    uniq, inv = np.unique(ids, return_inverse=True)
+    out = {'aoi': uniq}
     for k, v in values.items():
         out[k] = np.bincount(inv, weights=np.asarray(v, dtype=float), minlength=len(uniq))
     return pd.DataFrame(out)
-
-
-@lru_cache(maxsize=200_000)
-def _cell_polygon(cell):
-    """Shapely polygon (lng, lat) of an H3 cell with antimeridian unwrapped
-    so its longitudes are continuous (may extend past +/-180)."""
-    ring = np.array([(lng, lat) for lat, lng in h3i.cell_to_boundary(cell)])
-    lngs = ring[:, 0]
-    if lngs.max() - lngs.min() > 180:
-        lngs[lngs < 0] += 360.0
-    return shapely.Polygon(ring)
-
-
-def _cell_polygon_near(cell, ref_lng):
-    poly = _cell_polygon(cell)
-    cx = (poly.bounds[0] + poly.bounds[2]) / 2
-    shift = 360.0 * round((ref_lng - cx) / 360.0)
-    return shapely.transform(poly, lambda xy: xy + [shift, 0]) if shift else poly
-
-
-WGS84_A = 6378137.0
-WGS84_E2 = 0.00669437999014
-
-
-def lonlat_area_m2(area_deg2, lat):
-    """Area in m^2 of small lon/lat shapes on the WGS84 ellipsoid:
-    deg^2 * (pi/180)^2 * M(lat) * N(lat) * cos(lat)."""
-    phi = np.radians(lat)
-    w2 = 1.0 - WGS84_E2 * np.sin(phi) ** 2
-    m_n = (WGS84_A ** 2) * (1.0 - WGS84_E2) / (w2 ** 2)   # M * N
-    return area_deg2 * (math.pi / 180.0) ** 2 * m_n * np.cos(phi)
 
 
 # ---------------------------------------------------------------------------
@@ -231,58 +202,73 @@ def _isin(table, col, values):
 
 
 # ---------------------------------------------------------------------------
-# Layer processors: (path, row_groups, settings) -> DataFrame(h3, <metrics>)
+# Layer processors: (path, row_groups, settings, aoi) -> DataFrame(aoi, <metrics>)
 # ---------------------------------------------------------------------------
-def process_population(path, row_groups, s):
+def process_population(path, row_groups, s, a):
     geom_col, crs, cover = file_geo_info(path)
     t = read_table(path, row_groups, ['pop_value', cover if cover else geom_col])
     pop = t.column('pop_value').to_numpy(zero_copy_only=False).astype(float)
     keep = np.isfinite(pop) & (pop > 0)
     if not keep.any():
-        return sum_by_cell(np.array([], np.uint64), population=[])
+        return sum_by_aoi(np.array([], np.int64), population=[])
     t = t.filter(pa.array(keep))
     lng, lat = feature_centres(t, geom_col, cover, crs, path)
-    cells = latlng_to_cells(lat, lng, s['res'])
-    return sum_by_cell(cells, population=pop[keep])
+    cells = a.assign(lat, lng)
+    return sum_by_aoi(cells, population=pop[keep])
 
 
-def process_buildings(path, row_groups, s):
+def process_buildings(path, row_groups, s, a):
     geom_col, crs, cover = file_geo_info(path)
     t = read_table(path, row_groups, ['building', cover if cover else geom_col])
     keep = _isin(t, 'building', BUILDING_VALUES)
     if not keep.any():
-        return sum_by_cell(np.array([], np.uint64), buildings=[])
+        return sum_by_aoi(np.array([], np.int64), buildings=[])
     t = t.filter(pa.array(keep))
     lng, lat = feature_centres(t, geom_col, cover, crs, path)
-    cells = latlng_to_cells(lat, lng, s['res'])
-    return sum_by_cell(cells, buildings=np.ones(len(cells)))
+    cells = a.assign(lat, lng)
+    return sum_by_aoi(cells, buildings=np.ones(len(cells)))
 
 
 ROAD_SUB_BATCH = 100_000   # lines decoded/densified at a time (caps worker memory)
 
 
-def process_roads(path, row_groups, s):
+def process_roads(path, row_groups, s, a):
     geom_col, crs, _ = file_geo_info(path)
-    t = read_table(path, row_groups, ['highway', 'railway', geom_col])
-    parts = [_roads_table(t.slice(i, ROAD_SUB_BATCH), geom_col, crs, path, s)
+    t = read_table(path, row_groups, ['highway', 'railway', 'bridge', geom_col])
+    parts = [_roads_table(t.slice(i, ROAD_SUB_BATCH), geom_col, crs, path, s, a)
              for i in range(0, max(t.num_rows, 1), ROAD_SUB_BATCH)]
     df = pd.concat(parts, ignore_index=True)
-    return df.groupby('h3', as_index=False, sort=True).sum() if len(df) else df
+    return df.groupby('aoi', as_index=False, sort=True).sum() if len(df) else df
 
 
-def _roads_table(t, geom_col, crs, path, s):
+def _roads_table(t, geom_col, crs, path, s, aoi):
     major = _isin(t, 'highway', MAJOR_ROADS)
     minor = _isin(t, 'highway', MINOR_ROADS)
     rail = _isin(t, 'railway', RAILWAYS) & ~(major | minor)   # highway tag wins, as before
     klass = np.select([major, minor, rail], [0, 1, 2], -1)
     keep = klass >= 0
-    empty = sum_by_cell(np.array([], np.uint64), transportation_km=[])
+    empty = sum_by_aoi(np.array([], np.int64), transportation_km=[], bridges=[])
     if not keep.any():
         return empty
     t = t.filter(pa.array(keep))
     klass = klass[keep]
 
     geoms = geoms_to_lonlat(decode_geoms(t, geom_col), crs)
+
+    # Bridges: road/rail segments with a bridge=* tag other than "no". Each is
+    # counted once, in the cell holding the centre of its bounding box.
+    # (Files made before the bridge column existed simply give 0.)
+    if 'bridge' in t.column_names:
+        bcol = t.column('bridge')
+        is_bridge = pc.fill_null(pc.and_(pc.is_valid(bcol), pc.not_equal(bcol, 'no')), False)
+        is_bridge = is_bridge.to_numpy(zero_copy_only=False) & ~pd.isna(geoms)
+    else:
+        is_bridge = np.zeros(len(geoms), dtype=bool)
+    if is_bridge.any():
+        bb = shapely.bounds(geoms[is_bridge])
+        bridge_cells = aoi.assign((bb[:, 1] + bb[:, 3]) / 2, (bb[:, 0] + bb[:, 2]) / 2)
+    else:
+        bridge_cells = np.array([], np.int64)
     parts, idx = shapely.get_parts(geoms, return_index=True)
     is_line = np.isin(shapely.get_type_id(parts), [1, 2])     # LineString / LinearRing
     # Drop degenerate lines with fewer than 2 points (occur in raw OSM data);
@@ -290,65 +276,76 @@ def _roads_table(t, geom_col, crs, path, s):
     is_line &= shapely.get_num_coordinates(parts) >= 2
     parts, idx = parts[is_line], idx[is_line]
     if len(parts) == 0:
-        return empty
+        return sum_by_aoi(bridge_cells, transportation_km=np.zeros(len(bridge_cells)),
+                           bridges=np.ones(len(bridge_cells)))
     part_class = klass[idx]
     parts = shapely.segmentize(parts, s['road_seg_deg'])
     coords, ci = shapely.get_coordinates(parts, return_index=True)
     _check_degrees(coords[:, 0], coords[:, 1], path)
 
     same = ci[:-1] == ci[1:]
-    a, b, seg_part = coords[:-1][same], coords[1:][same], ci[:-1][same]
-    lng1, lat1, lng2, lat2 = (np.radians(a[:, 0]), np.radians(a[:, 1]),
-                              np.radians(b[:, 0]), np.radians(b[:, 1]))
+    p1, p2, seg_part = coords[:-1][same], coords[1:][same], ci[:-1][same]
+    lng1, lat1, lng2, lat2 = (np.radians(p1[:, 0]), np.radians(p1[:, 1]),
+                              np.radians(p2[:, 0]), np.radians(p2[:, 1]))
     h = (np.sin((lat2 - lat1) / 2) ** 2 +
          np.cos(lat1) * np.cos(lat2) * np.sin((lng2 - lng1) / 2) ** 2)
     length_km = 2 * EARTH_R * np.arcsin(np.sqrt(np.clip(h, 0, 1))) / 1000.0
 
-    cells = latlng_to_cells((a[:, 1] + b[:, 1]) / 2, (a[:, 0] + b[:, 0]) / 2, s['res'])
+    cells = aoi.assign((p1[:, 1] + p2[:, 1]) / 2, (p1[:, 0] + p2[:, 0]) / 2)
     # Classes are kept above only to decide which lines count; for now all
     # roads and railways are reported as one total.
-    return sum_by_cell(cells, transportation_km=length_km)
+    n_seg, n_br = len(cells), len(bridge_cells)
+    return sum_by_aoi(np.concatenate([cells, bridge_cells]),
+                       transportation_km=np.concatenate([length_km, np.zeros(n_br)]),
+                       bridges=np.concatenate([np.zeros(n_seg), np.ones(n_br)]))
 
 
-def _split_polygon(poly, res):
-    """Exact split of one (large) lon/lat polygon across H3 cells.
-    Returns (cells, area_m2)."""
-    if not poly.is_valid:
-        poly = shapely.make_valid(poly)
-    minx, miny, maxx, maxy = poly.bounds
-    box = h3i.LatLngPoly([(miny, minx), (miny, maxx), (maxy, maxx), (maxy, minx)])
-    cand = list(h3i.h3shape_to_cells_experimental(box, res, contain='overlap'))
-    if not cand:
-        cand = [h3i.latlng_to_cell((miny + maxy) / 2, (minx + maxx) / 2, res)]
-    ref = (minx + maxx) / 2
-    cell_polys = np.array([_cell_polygon_near(c, ref) for c in cand], dtype=object)
-    pieces = shapely.intersection(poly, cell_polys)
-    area_deg = shapely.area(pieces)
-    nz = area_deg > 0
-    if not nz.any():
-        return np.array([], np.uint64), np.array([])
-    bnd = shapely.bounds(pieces[nz])
-    lat_c = (bnd[:, 1] + bnd[:, 3]) / 2
-    return np.array(cand, dtype=np.uint64)[nz], lonlat_area_m2(area_deg[nz], lat_c)
+def process_dams(path, row_groups, s, a):
+    """Count dams and weirs. Reads only the waterway tag and the bbox column,
+    so it is cheap even on the big Lines/Polygons files."""
+    geom_col, crs, cover = file_geo_info(path)
+    empty = sum_by_aoi(np.array([], np.int64), dams=[], weirs=[])
+    if 'waterway' not in pq.read_schema(path).names:
+        return empty                     # older files without the waterway column
+    t = read_table(path, row_groups, ['waterway', cover if cover else geom_col])
+    is_dam = _isin(t, 'waterway', DAMS)
+    is_weir = _isin(t, 'waterway', WEIRS)
+    keep = is_dam | is_weir
+    if not keep.any():
+        return empty
+    t = t.filter(pa.array(keep))
+    lng, lat = feature_centres(t, geom_col, cover, crs, path)
+    cells = a.assign(lat, lng)
+    return sum_by_aoi(cells, dams=is_dam[keep], weirs=is_weir[keep])
 
 
 FARM_SUB_BATCH = 50_000    # polygons decoded/reprojected at a time (caps worker memory)
 
 
-def process_farmland(path, row_groups, s):
-    geom_col, crs, _ = file_geo_info(path)
+def process_farmland(path, row_groups, s, a):
+    geom_col, crs, cover = file_geo_info(path)
+    if 'area_m2' in pq.read_schema(path).names:
+        # Cropland blocks: one point per block carrying its exact cropland area.
+        t = read_table(path, row_groups, ['area_m2', cover if cover else geom_col])
+        if t.num_rows == 0:
+            return sum_by_aoi(np.array([], np.int64), farmland_km2=[])
+        lng, lat = feature_centres(t, geom_col, cover, crs, path)
+        area_km2 = t.column('area_m2').to_numpy(zero_copy_only=False) / 1e6
+        return sum_by_aoi(a.assign(lat, lng), farmland_km2=area_km2)
+
+    # Older polygon files (traced + simplified cropland polygons).
     t = read_table(path, row_groups, [geom_col])
-    parts = [_farmland_table(t.slice(i, FARM_SUB_BATCH), geom_col, crs, path, s)
+    parts = [_farmland_table(t.slice(i, FARM_SUB_BATCH), geom_col, crs, path, s, a)
              for i in range(0, max(t.num_rows, 1), FARM_SUB_BATCH)]
     df = pd.concat(parts, ignore_index=True)
-    return df.groupby('h3', as_index=False, sort=True).sum() if len(df) else df
+    return df.groupby('aoi', as_index=False, sort=True).sum() if len(df) else df
 
 
-def _farmland_table(t, geom_col, crs, path, s):
+def _farmland_table(t, geom_col, crs, path, s, a):
     geoms = geoms_to_lonlat(decode_geoms(t, geom_col), crs)
     geoms = geoms[~(shapely.is_empty(geoms) | pd.isna(geoms))]
     if len(geoms) == 0:
-        return sum_by_cell(np.array([], np.uint64), farmland_km2=[])
+        return sum_by_aoi(np.array([], np.int64), farmland_km2=[])
     bnd = shapely.bounds(geoms)
     _check_degrees(bnd[:, [0, 2]].ravel(), bnd[:, [1, 3]].ravel(), path)
     extent = np.maximum(bnd[:, 2] - bnd[:, 0], bnd[:, 3] - bnd[:, 1])
@@ -356,17 +353,17 @@ def _farmland_table(t, geom_col, crs, path, s):
 
     cx = (bnd[small, 0] + bnd[small, 2]) / 2
     cy = (bnd[small, 1] + bnd[small, 3]) / 2
-    cells = [latlng_to_cells(cy, cx, s['res'])]
+    cells = [a.assign(cy, cx)]
     area = [lonlat_area_m2(shapely.area(geoms[small]), cy)]
 
     for poly in geoms[~small]:
-        c, a = _split_polygon(poly, s['res'])
+        c, ar = a.split(poly)
         cells.append(c)
-        area.append(a)
+        area.append(ar)
 
     cells = np.concatenate(cells)
     area_km2 = np.concatenate(area) / 1e6
-    return sum_by_cell(cells, farmland_km2=area_km2)
+    return sum_by_aoi(cells, farmland_km2=area_km2)
 
 
 PROCESSORS = {
@@ -374,4 +371,33 @@ PROCESSORS = {
     "buildings":  process_buildings,
     "farmland":   process_farmland,
     "roads":      process_roads,
+    "dams":       process_dams,
 }
+
+
+# ---------------------------------------------------------------------------
+# Task extent (lets a polygon AOI load only the polygons a task needs)
+# ---------------------------------------------------------------------------
+def units_bbox(units, pad_deg=0.01):
+    """lon/lat (minx, miny, maxx, maxy) covering every feature in a task's
+    row groups, read from the covering-bbox column statistics (no data read).
+    None if any file lacks them - the AOI then loads all its polygons."""
+    from aoi import _rg_bbox
+    box = [np.inf, np.inf, -np.inf, -np.inf]
+    for path, row_groups in units:
+        _, crs, cover = file_geo_info(path)
+        if cover is None:
+            return None
+        md = pq.read_metadata(path)
+        for rg in row_groups:
+            rb = _rg_bbox(md, rg, cover)
+            if rb is None:
+                return None
+            xs = np.array([rb[0], rb[2], rb[0], rb[2], (rb[0] + rb[2]) / 2, (rb[0] + rb[2]) / 2])
+            ys = np.array([rb[1], rb[1], rb[3], rb[3], rb[1], rb[3]])
+            xs, ys = points_to_lonlat(xs, ys, crs)     # no-op for lon/lat files
+            box = [min(box[0], np.min(xs)), min(box[1], np.min(ys)),
+                   max(box[2], np.max(xs)), max(box[3], np.max(ys))]
+    if box[0] > box[2]:
+        return (0.0, 0.0, 0.0, 0.0)
+    return (box[0] - pad_deg, box[1] - pad_deg, box[2] + pad_deg, box[3] + pad_deg)

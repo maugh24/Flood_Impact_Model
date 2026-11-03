@@ -19,3 +19,6 @@ mprofile_*.dat
 *.csv
 *.geojson
 *.sha256
+
+# Run logs
+*.log

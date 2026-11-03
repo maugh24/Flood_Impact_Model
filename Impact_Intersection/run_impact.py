@@ -1,17 +1,22 @@
 """
-Global flood-impact (exposure) per H3 cell, for FEWS4All.
+Flood-impact exposure per area of interest (AOI), for FEWS4All.
 
-    python run_h3_impact.py            # full run with the settings in config.py
-    python run_h3_impact.py --check    # list inputs/tasks only, process nothing
+Normally started through run_impact.sh:
+    ./run_impact.sh h3              # AOI preset name from config.AOIS
+    ./run_impact.sh geoglows --check
 
-Outputs (in OUTPUT_FOLDER):
-    impact_h3r6_<label>.csv           one row per cell with any exposure
-    impact_h3r6_<label>_summary.csv   global totals (one row)
-    impact_h3r6_<label>_metadata.csv  column units, descriptions, sources
+or directly:
+    python run_impact.py --aoi h3 [--check] [--layers ...] [--workers N]
 
-Resumable: every task writes a small CSV under OUTPUT_FOLDER/_partials/<layer>/.
-Rerunning skips tasks that already have one, so a crash only loses in-flight
-tasks. The final CSVs are only written once every task of every layer is done.
+Outputs (in OUTPUT_FOLDER/<aoi>/):
+    impact_<aoi>_<label>.csv           one row per AOI with any exposure
+    impact_<aoi>_<label>_summary.csv   totals (one row)
+    impact_<aoi>_<label>_metadata.csv  column units, descriptions, sources
+
+Resumable: every task writes a small CSV under OUTPUT_FOLDER/<aoi>/_partials_<id>/.
+<id> changes whenever the AOI definition (H3 resolution, or the polygon file)
+changes, so results for an old AOI version are never mixed in. Rerunning skips
+finished tasks; only partials belonging to the CURRENT inputs are merged.
 """
 import argparse
 import hashlib
@@ -30,35 +35,59 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config                                              # noqa: E402
-from h3_impact import PROCESSORS, LAYER_COLUMNS            # noqa: E402
+from aoi import make_aoi, aoi_file_info                    # noqa: E402
+from layers import PROCESSORS, LAYER_COLUMNS, units_bbox   # noqa: E402
 
 try:
     from tqdm import tqdm
 except ImportError:                                        # tqdm is optional
     tqdm = None
 
-COLUMN_ORDER = ["population", "buildings", "farmland_km2", "transportation_km"]
+COLUMN_ORDER = ["population", "buildings", "farmland_km2", "transportation_km",
+                "bridges", "dams", "weirs"]
 COLUMN_INFO = {
-    "h3_id":         ("", "H3 cell index (resolution {res}), lowercase hex string"),
     "population":    ("people", "Population in the cell"),
     "buildings":     ("count", "OSM buildings whose footprint centre is in the cell"),
     "farmland_km2":  ("km2", "Cropland area in the cell"),
     "transportation_km": ("km", "Roads (motorway, trunk, primary, secondary, tertiary, residential, "
                                 "links, living street, busway, footway, cycleway) plus railways "
                                 "(rail, light rail, subway, monorail, tram)"),
+    "bridges":       ("count", "OSM road/rail segments tagged bridge=* (not 'no'), by segment centre"),
+    "dams":          ("count", "OSM waterway=dam features (lines, areas, points), by feature centre"),
+    "weirs":         ("count", "OSM waterway=weir and check_dam features, by feature centre"),
 }
-DECIMALS = {"population": 0, "buildings": 0, "farmland_km2": 2, "transportation_km": 2}
+DECIMALS = {"population": 0, "buildings": 0, "farmland_km2": 2, "transportation_km": 2,
+            "bridges": 0, "dams": 0, "weirs": 0}
 
 
 # ---------------------------------------------------------------------------
 # Planning
 # ---------------------------------------------------------------------------
-def resolve_input(data_root, spec):
+def resolve_path(data_root, raw):
     # Accept Windows-style backslashes on any OS.
-    p = Path(str(spec["path"]).replace("\\", "/"))
+    p = Path(str(raw).replace("\\", "/"))
     if not p.is_absolute():
         p = Path(str(data_root).replace("\\", "/")) / p
-    return p, spec.get("pattern", "*.parquet")
+    return p
+
+
+def layer_files(data_root, spec):
+    """(list of resolved paths, [(file, root, rel_name), ...]) for one layer.
+    spec["path"] may be one path or a list of paths (e.g. the dams layer reads
+    the Lines, Polygons and Points folders)."""
+    raw_paths = spec["path"] if isinstance(spec["path"], (list, tuple)) else [spec["path"]]
+    pattern = spec.get("pattern", "*.parquet")
+    paths, found = [], []
+    for raw in raw_paths:
+        p = resolve_path(data_root, raw)
+        paths.append(p)
+        files, root = list_files(p, pattern)
+        for f in files:
+            rel = f.relative_to(root).as_posix() if f != root else f.name
+            if len(raw_paths) > 1:
+                rel = f"{root.name}/{rel}"      # keep ids unique across folders
+            found.append((f, rel))
+    return paths, found
 
 
 def list_files(path, pattern):
@@ -84,8 +113,9 @@ def plan_layer(layer, data_root, target_rows):
     """Split a layer into tasks of ~target_rows. A task is a list of
     (file, [row groups]) units, so many small files (e.g. ESA chunks) can share
     one task. Task ids are deterministic, which is what makes resume work."""
-    path, pattern = resolve_input(data_root, config.INPUTS[layer])
-    files, root = list_files(path, pattern)
+    paths, found = layer_files(data_root, config.INPUTS[layer])
+    files = [f for f, _ in found]
+    rel_of = {f: rel for f, rel in found}
     with ThreadPoolExecutor(max_workers=16) as ex:          # footer reads are I/O bound
         footers = list(ex.map(_footer, files))
 
@@ -105,7 +135,7 @@ def plan_layer(layer, data_root, target_rows):
         if err is not None:
             print(f"  [{layer}] cannot read {f}: {err}")
             continue
-        rel = f.relative_to(root).as_posix() if f != root else f.name
+        rel = rel_of[f]
         cur = []
         for rg, n in enumerate(rg_rows):
             cur.append(rg)
@@ -119,26 +149,61 @@ def plan_layer(layer, data_root, target_rows):
             units.append((str(f), cur))
             desc.append(f"{rel}:{cur[0]}-{cur[-1]}")
     flush()
-    return path, files, tasks, total_rows
+    return paths, files, tasks, total_rows
+
+
+def finished_tasks(part_dir, columns):
+    """Task ids with a partial CSV that has every column this code writes.
+    A partial from an older version of the code (missing a column) is redone."""
+    done = set()
+    if part_dir.exists():
+        for p in part_dir.glob("*.csv"):
+            with open(p) as fh:
+                header = fh.readline().strip().split(",")
+            if set(columns) <= set(header):
+                done.add(p.stem)
+    return done
 
 
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
+_H3_AOI = {}      # per-worker cache: an H3 AOI is the same for every task
+
+
+def task_aoi(spec, units):
+    if spec["type"] == "h3":
+        key = spec["resolution"]
+        if key not in _H3_AOI:
+            _H3_AOI[key] = make_aoi(spec)
+        return _H3_AOI[key]
+    # Polygon set: load only the polygons overlapping this task's features.
+    return make_aoi(spec, units_bbox(units))
+
+
 def run_task(args):
     (layer, units, task_id), settings, out_dir = args
     out = Path(out_dir) / layer / f"{task_id}.csv"
-    try:
-        dfs = [PROCESSORS[layer](path, row_groups, settings) for path, row_groups in units]
-        df = pd.concat(dfs, ignore_index=True)
-        if len(units) > 1 and len(df):
-            df = df.groupby("h3", as_index=False, sort=True).sum()
-        tmp = out.with_suffix(".tmp")
-        df.to_csv(tmp, index=False)
-        os.replace(tmp, out)                     # atomic: never a half-written partial
-        return layer, task_id, None
-    except Exception:
-        return layer, task_id, traceback.format_exc()
+    for attempt in range(3):
+        try:
+            aoi = task_aoi(settings["aoi"], units)
+            dfs = [PROCESSORS[layer](path, row_groups, settings, aoi) for path, row_groups in units]
+            df = pd.concat(dfs, ignore_index=True)
+            if len(units) > 1 and len(df):
+                df = df.groupby("aoi", as_index=False, sort=True).sum()
+            tmp = out.with_suffix(".tmp")
+            df.to_csv(tmp, index=False)
+            os.replace(tmp, out)                 # atomic: never a half-written partial
+            return layer, task_id, None
+        except OSError:
+            # Read errors from an external drive are often transient
+            # (e.g. "Input/output error" when it spins down): retry twice.
+            if attempt < 2:
+                time.sleep(10)
+                continue
+            return layer, task_id, traceback.format_exc()
+        except Exception:
+            return layer, task_id, traceback.format_exc()
 
 
 # ---------------------------------------------------------------------------
@@ -146,15 +211,15 @@ def run_task(args):
 # ---------------------------------------------------------------------------
 def _reduce(frames):
     df = pd.concat(frames, ignore_index=True)
-    return df.groupby("h3", sort=False).sum()
+    return df.groupby("aoi", sort=False).sum()
 
 
-def merge_layer(part_dir, columns, batch_rows=5_000_000):
-    files = sorted(part_dir.glob("*.csv"))
-    dtypes = {"h3": np.uint64, **{c: float for c in columns}}
+def merge_layer(part_dir, columns, task_ids, batch_rows=5_000_000):
+    files = [part_dir / f"{t}.csv" for t in sorted(task_ids)]
+    dtypes = {"aoi": np.int64, **{c: float for c in columns}}
     total, batch, n = None, [], 0
     for f in files:
-        df = pd.read_csv(f, dtype=dtypes)
+        df = pd.read_csv(f, dtype=dtypes, usecols=["aoi", *columns])
         if len(df):
             batch.append(df)
             n += len(df)
@@ -166,16 +231,16 @@ def merge_layer(part_dir, columns, batch_rows=5_000_000):
         part = _reduce(batch)
         total = part if total is None else _reduce([total.reset_index(), part.reset_index()])
     if total is None:
-        total = pd.DataFrame(columns=columns, index=pd.Index([], dtype=np.uint64, name="h3"))
+        total = pd.DataFrame(columns=columns, index=pd.Index([], dtype=np.int64, name="aoi"))
     return total[columns]
 
 
-def write_outputs(out_dir, layers, res, label, sources):
-    stem = f"impact_h3r{res}_{label}"
+def write_outputs(out_dir, part_root, aoi_name, spec, layers, label, sources, planned):
+    stem = f"impact_{aoi_name}_{label}"
     frames = []
     for layer in layers:
         print(f"  merging {layer} ...")
-        frames.append(merge_layer(out_dir / "_partials" / layer, LAYER_COLUMNS[layer]))
+        frames.append(merge_layer(part_root / layer, LAYER_COLUMNS[layer], planned[layer]))
     combined = pd.concat(frames, axis=1).fillna(0.0)
     cols = [c for c in COLUMN_ORDER if c in combined.columns]
     combined = combined[cols]
@@ -186,23 +251,33 @@ def write_outputs(out_dir, layers, res, label, sources):
         d = DECIMALS[c]
         rounded[c] = combined[c].round(d).astype("int64") if d == 0 else combined[c].round(d)
     rounded = rounded[(rounded != 0).any(axis=1)].sort_index()
-    rounded.insert(0, "h3_id", [format(int(h), "x") for h in rounded.index])
+    if spec["type"] == "h3":
+        id_col = "h3_id"
+        id_desc = f"H3 cell index (resolution {spec['resolution']}), lowercase hex string"
+        id_src = "H3 (Uber) v4"
+        rounded.insert(0, id_col, [format(int(h), "x") for h in rounded.index])
+    else:
+        id_col = spec["id_column"]
+        id_desc = spec.get("description", f"{id_col} of the AOI polygon")
+        id_src = spec.get("source", str(spec["path"]))
+        rounded.insert(0, id_col, rounded.index.astype(np.int64))
 
     main_csv = out_dir / f"{stem}.csv"
     rounded.to_csv(main_csv, index=False)
 
-    summary = {"cells": [len(rounded)]}
+    summary = {"aoi_count": [len(rounded)]}      # AOIs (cells/basins) with any exposure
     for c in cols:
         summary[c] = [round(float(totals[c]), DECIMALS[c]) if DECIMALS[c] else int(round(totals[c]))]
     pd.DataFrame(summary).to_csv(out_dir / f"{stem}_summary.csv", index=False)
 
     run_date = datetime.now().strftime("%Y-%m-%d")
     meta = []
-    for c in ["h3_id"] + cols:
+    meta.append({"column": id_col, "unit": "", "description": id_desc, "source": id_src,
+                 "aoi": aoi_name, "run_date": run_date})
+    for c in cols:
         unit, desc = COLUMN_INFO[c]
-        meta.append({"column": c, "unit": unit, "description": desc.format(res=res),
-                     "source": sources.get(c, "H3 (Uber) v4" if c == "h3_id" else ""),
-                     "h3_resolution": res, "run_date": run_date})
+        meta.append({"column": c, "unit": unit, "description": desc,
+                     "source": sources.get(c, ""), "aoi": aoi_name, "run_date": run_date})
     pd.DataFrame(meta).to_csv(out_dir / f"{stem}_metadata.csv", index=False)
 
     print(f"  wrote {main_csv} ({len(rounded):,} cells)")
@@ -214,6 +289,8 @@ def write_outputs(out_dir, layers, res, label, sources):
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--aoi", required=True, choices=list(config.AOIS),
+                    help="area-of-interest preset from config.AOIS")
     ap.add_argument("--data-root", default=config.DATA_ROOT)
     ap.add_argument("--output", default=config.OUTPUT_FOLDER)
     ap.add_argument("--workers", type=int, default=config.MAX_WORKERS)
@@ -223,27 +300,58 @@ def main():
     ap.add_argument("--merge-only", action="store_true", help="skip processing; build CSVs from partials")
     args = ap.parse_args()
 
-    res = config.H3_RESOLUTION
     label = args.label or datetime.now().strftime("%Y-%m")
-    out_dir = Path(args.output)
-    settings = {"res": res,
+    spec = dict(config.AOIS[args.aoi])
+    if spec["type"] == "h3":
+        fingerprint = f"h3r{spec['resolution']}"
+        aoi_desc = f"H3 cells, resolution {spec['resolution']}"
+    else:
+        spec["path"] = str(resolve_path(args.data_root, spec["path"]))
+        p = Path(spec["path"])
+        if not p.is_file():
+            print(f"AOI file not found: {p}\nPrepare it with Data_Prep/AOI/prepare_aoi.py first.")
+            return 1
+        geom_col, cover = aoi_file_info(p)
+        names = pq.read_schema(p).names
+        if spec["id_column"] not in names or cover is None:
+            print(f"{p} is not a prepared AOI file (needs column '{spec['id_column']}' and a "
+                  f"covering bbox). Run Data_Prep/AOI/prepare_aoi.py on it.")
+            return 1
+        st = p.stat()
+        fingerprint = "poly_" + hashlib.md5(
+            f"{p.name}|{st.st_size}|{int(st.st_mtime)}|{spec['id_column']}".encode()).hexdigest()[:8]
+        aoi_desc = f"{pq.read_metadata(p).num_rows:,} polygons, id {spec['id_column']}  <- {p}"
+
+    out_dir = Path(args.output) / args.aoi
+    part_root = out_dir / f"_partials_{fingerprint}"
+    settings = {"aoi": spec,
                 "farm_split_deg": config.FARMLAND_SPLIT_EXTENT_DEG,
                 "road_seg_deg": config.ROAD_MAX_SEGMENT_DEG}
 
     print("=" * 78)
-    print(f"H3 FLOOD IMPACT  |  res {res}  |  label {label}  |  workers {args.workers}")
+    print(f"FLOOD IMPACT  |  AOI {args.aoi}  |  label {label}  |  workers {args.workers}")
+    print(f"AOI      : {aoi_desc}")
     print(f"data root: {args.data_root}")
     print(f"output   : {out_dir}")
     print("=" * 78)
 
-    all_tasks, missing = [], []
+    # Farmland needs an h3 recent enough to split polygons along cell edges.
+    from h3.api import basic_int as _h3i
+    if (spec["type"] == "h3" and "farmland" in args.layers
+            and not hasattr(_h3i, "h3shape_to_cells_experimental")):
+        import h3
+        print(f"h3 {h3.__version__} is too old (need >= 4.1). Run: pip install -U \"h3>=4.1\"")
+        return 1
+
+    all_tasks, missing, planned = [], [], {}
     for layer in args.layers:
-        path, files, tasks, rows = plan_layer(layer, args.data_root, config.TARGET_ROWS_PER_TASK[layer])
-        part_dir = out_dir / "_partials" / layer
-        done = {p.stem for p in part_dir.glob("*.csv")} if part_dir.exists() else set()
+        paths, files, tasks, rows = plan_layer(layer, args.data_root, config.TARGET_ROWS_PER_TASK[layer])
+        planned[layer] = {t[2] for t in tasks}
+        done = finished_tasks(part_root / layer, LAYER_COLUMNS[layer])
         todo = [t for t in tasks if t[2] not in done]
+        shown = "  +  ".join(str(p) for p in paths)
         print(f"{layer:<11} {len(files):>6} files  {rows:>14,} rows  "
-              f"{len(tasks):>6} tasks  ({len(tasks) - len(todo)} done)  <- {path}")
+              f"{len(tasks):>6} tasks  ({len(tasks) - len(todo)} done)  <- {shown}")
         if not files:
             missing.append(layer)
         all_tasks.extend(todo)
@@ -257,13 +365,13 @@ def main():
         return 1
 
     for layer in args.layers:
-        (out_dir / "_partials" / layer).mkdir(parents=True, exist_ok=True)
+        (part_root / layer).mkdir(parents=True, exist_ok=True)
 
     failed = []
     if all_tasks and not args.merge_only:
         # Interleave layers so heavy and light tasks mix across workers.
         all_tasks.sort(key=lambda t: (t[2], t[0]))
-        jobs = [(t, settings, str(out_dir / "_partials")) for t in all_tasks]
+        jobs = [(t, settings, str(part_root)) for t in all_tasks]
         start = time.time()
         with mp.Pool(processes=args.workers, maxtasksperchild=25) as pool:
             it = pool.imap_unordered(run_task, jobs)
@@ -289,7 +397,7 @@ def main():
             pass
 
     print("Building output CSVs ...")
-    write_outputs(out_dir, args.layers, res, label, config.SOURCES)
+    write_outputs(out_dir, part_root, args.aoi, spec, args.layers, label, config.SOURCES, planned)
     print("=" * 78)
     return 0
 

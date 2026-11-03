@@ -111,10 +111,10 @@ def run_single_job(area_label: str, rp_label: str, flood_file: str,
     Raises on failure so the parent process can report it.
     """
     # Deferred imports — required for Windows spawn start method
-    from Population_Impact_MRP import calculate_flood_population, aggregate_population_for_csv
-    from Farmland_Impact_MRP   import calculate_flood_farmland,   aggregate_farmland_for_csv
-    from Building_Impact_MRP   import calculate_flood_buildings,  aggregate_buildings_for_csv
-    from Road_Impact_MRP       import calculate_flood_transportation, aggregate_transportation_for_csv
+    from Flood_Impact_Code.Archive.Multiple_Return_Periods.Population_Impact_MRP import calculate_flood_population, aggregate_population_for_csv
+    from Flood_Impact_Code.Archive.Multiple_Return_Periods.Farmland_Impact_MRP   import calculate_flood_farmland,   aggregate_farmland_for_csv
+    from Flood_Impact_Code.Archive.Multiple_Return_Periods.Building_Impact_MRP   import calculate_flood_buildings,  aggregate_buildings_for_csv
+    from Flood_Impact_Code.Archive.Multiple_Return_Periods.Road_Impact_MRP       import calculate_flood_transportation, aggregate_transportation_for_csv
 
     tag     = f"[{area_label} | {rp_label}]"
     out_dir = Path(master_output) / f"{area_label}_Results" / rp_label
