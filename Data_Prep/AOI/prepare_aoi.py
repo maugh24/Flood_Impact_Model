@@ -9,7 +9,7 @@ folder of them; --pattern picks the files in a folder, e.g. for the GEOGLOWS
 VPU layout:
 
     python prepare_aoi.py /path/GEOGLOW_Catchments LINKNO \\
-        /Users/maugh24/Flood_Impact_Model/Files/AOI/geoglows_catchments.parquet \\
+        ~/Flood_Impact_Model/Files/AOI/geoglows_catchments.parquet \\
         --pattern "vpu=*/*.parquet"
 
 The output is one GeoParquet that the intersection run can read quickly:

@@ -40,7 +40,8 @@ REGIONS="africa antarctica asia australia-oceania central-america europe north-a
 #   Points/    <region>-points.parquet     (dams/weirs mapped as single points)
 #   pbf/       downloads, deleted once a region is finished (see KEEP_PBF)
 #   tmp/       GDAL scratch space (can reach tens of GB for europe/asia)
-WORK_DIR="${WORK_DIR:-/Users/maugh24/Flood_Impact_Model/Files/OSM_Prep}"
+# $HOME is your home folder (/Users/<your user name>), so this works on any Mac.
+WORK_DIR="${WORK_DIR:-$HOME/Flood_Impact_Model/Files/OSM_Prep}"
 
 # Memory (MB) GDAL may use for its node index before spilling to tmp/.
 # Bigger = faster on large regions. Keep it well under your RAM.

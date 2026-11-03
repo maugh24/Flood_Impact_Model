@@ -8,13 +8,13 @@ file, writes a `.sha256`, and deletes the download.
 
 ## Run
 ```bash
-cd /Users/maugh24/Flood_Impact_Model/Flood_Impact_Code/Data_Prep/Farmland
+cd ~/Flood_Impact_Model/Flood_Impact_Code/Data_Prep/Farmland
 chmod +x farmland_prep.sh                       # once
 ./farmland_prep.sh --bbox -81 21 -75 24         # a few tiles first, as a test
 ./farmland_prep.sh                              # every tile (~2,650)
 ```
 Options (`python farmland_prep.py --help`):
-- `--work-dir` (default `/Users/maugh24/Flood_Impact_Model/Files`): output to `Farmland/`,
+- `--work-dir` (default `~/Flood_Impact_Model/Files`): output to `Farmland/`,
   temporary downloads to `Farmland_download/`
 - `--workers N` tiles at once (default 4, ~2 GB RAM each)
 - `--block-px N` block size in pixels (default 15)

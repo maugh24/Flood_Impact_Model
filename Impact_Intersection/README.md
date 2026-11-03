@@ -14,7 +14,8 @@ any polygon set you prepare.
 1. **Prep once** (on the computation Mac, all under `DATA_ROOT`):
    - `Data_Prep/OSM/osm_prep.sh` -> `OSM_Prep/Lines`, `Polygons`, `Points`
    - `Data_Prep/Farmland/farmland_prep.sh` -> `Farmland/` (ESA WorldCover cropland blocks)
-   - population parquet -> `Population/`
+   - `Data_Prep/Population/population_prep.sh` -> `Population/worldpop_<year>_1km.parquet`
+     (set the same year as `POPULATION_YEAR` in `config.py`)
    - each polygon AOI set -> `AOI/<name>.parquet` with `Data_Prep/AOI/prepare_aoi.py`
 2. **Intersect** as often as needed: `./run_impact.sh <aoi>`. Changing the AOI never means
    re-prepping the exposure data.
@@ -32,7 +33,7 @@ INPUT is a file (GeoParquet, GPKG, shapefile, GeoJSON) or a folder of them; the 
 integer. For the GEOGLOWS VPU layout:
 ```
 python ../Data_Prep/AOI/prepare_aoi.py /path/GEOGLOW_Catchments LINKNO \
-    /Users/maugh24/Flood_Impact_Model/Files/AOI/geoglows_catchments.parquet --pattern "vpu=*/*.parquet"
+    ~/Flood_Impact_Model/Files/AOI/geoglows_catchments.parquet --pattern "vpu=*/*.parquet"
 ```
 Then add an entry to `AOIS` in `config.py` (copy the `geoglows` one).
 

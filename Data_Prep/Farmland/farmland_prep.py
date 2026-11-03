@@ -241,7 +241,7 @@ def process_tile(code, out_dir, tif_dir, local_tifs, block_px, keep_tif):
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--work-dir", default="/Users/maugh24/Flood_Impact_Model/Files",
+    ap.add_argument("--work-dir", default=str(Path.home() / "Flood_Impact_Model" / "Files"),
                     help="outputs go to WORK_DIR/Farmland, downloads to WORK_DIR/Farmland_download")
     ap.add_argument("--workers", type=int, default=4, help="tiles processed at once (~2 GB RAM each)")
     ap.add_argument("--block-px", type=int, default=15, help="block size in 10 m pixels (15 = ~150 m)")

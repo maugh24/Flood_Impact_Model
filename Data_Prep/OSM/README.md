@@ -18,7 +18,7 @@ GDAL >= 3.9 with the Parquet driver (`ogrinfo --formats | grep -i parquet` must 
 
 ## Run
 ```bash
-cd /Users/maugh24/Flood_Impact_Model/Flood_Impact_Code/Data_Prep/OSM
+cd ~/Flood_Impact_Model/Flood_Impact_Code/Data_Prep/OSM
 chmod +x osm_prep.sh                 # once: allow the file to be run as a program
 DRY_RUN=1 ./osm_prep.sh antarctica   # print the commands only
 ./osm_prep.sh antarctica             # smallest region (~30 MB) as a first real test

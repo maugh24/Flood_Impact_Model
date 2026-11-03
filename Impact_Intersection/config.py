@@ -7,7 +7,7 @@ files - lives under DATA_ROOT on the computation Mac:
 
     DATA_ROOT/
         OSM_Prep/      Lines/  Polygons/  Points/   (Data_Prep/OSM/osm_prep.sh)
-        Population/    population.parquet
+        Population/    worldpop_<year>_1km.parquet  (Data_Prep/Population/population_prep.sh)
         Farmland/      <tile>.parquet           (Data_Prep/Farmland/farmland_prep.sh)
         AOI/           geoglows_catchments.parquet, hydrobasins.parquet, ...
                        (Data_Prep/AOI/prepare_aoi.py)
@@ -20,16 +20,20 @@ import os
 # ---------------------------------------------------------------------------
 # Paths (edit these)
 # ---------------------------------------------------------------------------
-DATA_ROOT = r"/Users/maugh24/Flood_Impact_Model/Files"
+# "~" is your home folder (/Users/<your user name>), so these work on any Mac.
+DATA_ROOT = os.path.expanduser("~/Flood_Impact_Model/Files")
+
+# WorldPop year made by population_prep.sh (its --year).
+POPULATION_YEAR = 2024
 
 # Results go to OUTPUT_FOLDER/<aoi name>/ (plus a resumable _partials_* folder).
-OUTPUT_FOLDER = r"/Users/maugh24/Flood_Impact_Model/Impact_Results"
+OUTPUT_FOLDER = os.path.expanduser("~/Flood_Impact_Model/Impact_Results")
 
 # Exposure inputs. "path" is relative to DATA_ROOT (or absolute) and may be a
 # file, a folder, or a list of folders; "pattern" is the glob used in folders
 # ("**" = search subfolders). Forward slashes work on macOS, Linux and Windows.
 INPUTS = {
-    "population": {"path": "Population/population.parquet", "pattern": "*.parquet"},
+    "population": {"path": f"Population/worldpop_{POPULATION_YEAR}_1km.parquet"},
     # Cropland blocks from farmland_prep.sh. The older polygon chunks also work:
     # {"path": "ESA/bbox", "pattern": "**/*.parquet"}
     "farmland":   {"path": "Farmland",                      "pattern": "*.parquet"},
@@ -98,7 +102,7 @@ ROAD_MAX_SEGMENT_DEG = 0.005
 
 # Written to the metadata CSV so FEWS4All can attribute the numbers.
 SOURCES = {
-    "population":        "WorldPop 2025 constrained 1 km (UN-adjusted)",
+    "population":        f"WorldPop {POPULATION_YEAR} constrained 1 km (UN-adjusted, R2025A)",
     "buildings":         "OpenStreetMap (Geofabrik extracts)",
     "farmland_km2":      "ESA WorldCover 2021 v200 (class 40 cropland)",
     "transportation_km": "OpenStreetMap (Geofabrik extracts)",

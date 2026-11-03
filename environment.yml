@@ -1,0 +1,22 @@
+# Conda environment for the whole Flood Impact Model pipeline
+# (Data_Prep/OSM, Data_Prep/Farmland, Data_Prep/AOI, Impact_Intersection).
+#   conda env create -f environment.yml
+#   conda activate flood_impact
+# Tested with: python 3.12, gdal 3.13.3, pyarrow 26, pandas 3.1, numpy 2.5,
+# shapely 2.2, geopandas 1.2, rasterio 1.5, h3 4.5 (Apple Silicon and Intel Macs).
+name: flood_impact
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - gdal>=3.9                # ogr2ogr / ogrinfo for the OSM prep
+  - libgdal-arrow-parquet    # lets GDAL write GeoParquet (not included in gdal itself)
+  - pyarrow>=14
+  - numpy
+  - pandas
+  - shapely>=2.0
+  - pyproj
+  - geopandas>=1.0           # Data_Prep/AOI/prepare_aoi.py
+  - rasterio                 # Data_Prep/Farmland/farmland_prep.py
+  - h3-py>=4.1               # H3 cells (conda's name for the h3 package)
+  - tqdm
