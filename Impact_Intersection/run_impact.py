@@ -2,16 +2,21 @@
 Flood-impact exposure per area of interest (AOI), for FEWS4All.
 
 Normally started through run_impact.sh:
-    ./run_impact.sh h3              # AOI preset name from config.AOIS
+    ./run_impact.sh h3 6            # AOI preset name from config.AOIS + level
+    ./run_impact.sh hydrobasins 8
     ./run_impact.sh geoglows --check
 
 or directly:
-    python run_impact.py --aoi h3 [--check] [--layers ...] [--workers N]
+    python run_impact.py --aoi h3 --level 6 [--check] [--layers ...] [--workers N]
 
-Outputs (in OUTPUT_FOLDER/<aoi>/):
-    impact_<aoi>_<label>.csv           one row per AOI with any exposure
-    impact_<aoi>_<label>_summary.csv   totals (one row)
-    impact_<aoi>_<label>_metadata.csv  column units, descriptions, sources
+The level is the H3 resolution or the HydroBASINS level; GEOGLOWS has none.
+GEOGLOWS and HydroBASINS polygons are downloaded and prepared automatically
+the first time they are used (Data_Prep/AOI/aoi_prep.py).
+
+Outputs (in OUTPUT_FOLDER/<aoi>_<level>/, or <aoi>/ without a level):
+    impact_<aoi>_<level>_<label>.csv           one row per AOI with any exposure
+    impact_<aoi>_<level>_<label>_summary.csv   totals (one row)
+    impact_<aoi>_<level>_<label>_metadata.csv  column units, descriptions, sources
 
 Resumable: every task writes a small CSV under OUTPUT_FOLDER/<aoi>/_partials_<id>/.
 <id> changes whenever the AOI definition (H3 resolution, or the polygon file)
@@ -35,7 +40,7 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config                                              # noqa: E402
-from aoi import make_aoi, aoi_file_info                    # noqa: E402
+from aoi import make_aoi, aoi_file_info, aoi_parts         # noqa: E402
 from layers import PROCESSORS, LAYER_COLUMNS, units_bbox   # noqa: E402
 
 try:
@@ -173,7 +178,7 @@ _H3_AOI = {}      # per-worker cache: an H3 AOI is the same for every task
 
 def task_aoi(spec, units):
     if spec["type"] == "h3":
-        key = spec["resolution"]
+        key = spec["level"]
         if key not in _H3_AOI:
             _H3_AOI[key] = make_aoi(spec)
         return _H3_AOI[key]
@@ -253,12 +258,12 @@ def write_outputs(out_dir, part_root, aoi_name, spec, layers, label, sources, pl
     rounded = rounded[(rounded != 0).any(axis=1)].sort_index()
     if spec["type"] == "h3":
         id_col = "h3_id"
-        id_desc = f"H3 cell index (resolution {spec['resolution']}), lowercase hex string"
+        id_desc = f"H3 cell index (resolution {spec['level']}), lowercase hex string"
         id_src = "H3 (Uber) v4"
         rounded.insert(0, id_col, [format(int(h), "x") for h in rounded.index])
     else:
         id_col = spec["id_column"]
-        id_desc = spec.get("description", f"{id_col} of the AOI polygon")
+        id_desc = spec.get("description", f"{id_col} of the AOI polygon").format(level=spec.get("level"))
         id_src = spec.get("source", str(spec["path"]))
         rounded.insert(0, id_col, rounded.index.astype(np.int64))
 
@@ -291,6 +296,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--aoi", required=True, choices=list(config.AOIS),
                     help="area-of-interest preset from config.AOIS")
+    ap.add_argument("--level", type=int,
+                    help="H3 resolution / HydroBASINS level (default from config.AOIS)")
     ap.add_argument("--data-root", default=config.DATA_ROOT)
     ap.add_argument("--output", default=config.OUTPUT_FOLDER)
     ap.add_argument("--workers", type=int, default=config.MAX_WORKERS)
@@ -302,34 +309,65 @@ def main():
 
     label = args.label or datetime.now().strftime("%Y-%m")
     spec = dict(config.AOIS[args.aoi])
-    if spec["type"] == "h3":
-        fingerprint = f"h3r{spec['resolution']}"
-        aoi_desc = f"H3 cells, resolution {spec['resolution']}"
-    else:
-        spec["path"] = str(resolve_path(args.data_root, spec["path"]))
-        p = Path(spec["path"])
-        if not p.is_file():
-            print(f"AOI file not found: {p}\nPrepare it with Data_Prep/AOI/prepare_aoi.py first.")
+
+    # Level (H3 resolution / HydroBASINS level). AOIs without levels take none.
+    levels = spec.get("levels")
+    if levels is None:
+        if args.level is not None:
+            print(f"AOI '{args.aoi}' has a single level; leave the number off.")
             return 1
-        geom_col, cover = aoi_file_info(p)
-        names = pq.read_schema(p).names
-        if spec["id_column"] not in names or cover is None:
-            print(f"{p} is not a prepared AOI file (needs column '{spec['id_column']}' and a "
+        level, aoi_name = None, args.aoi
+    else:
+        level = spec.get("default_level") if args.level is None else args.level
+        if level not in levels:
+            print(f"AOI '{args.aoi}': level must be {min(levels)}-{max(levels)}, got {level}.")
+            return 1
+        aoi_name = f"{args.aoi}_{level}"
+    spec["level"] = level
+
+    if spec["type"] == "h3":
+        fingerprint = f"h3r{level}"
+        aoi_desc = f"H3 cells, resolution {level}"
+    else:
+        spec["path"] = str(resolve_path(args.data_root, spec["path"].format(level=level)))
+        p = Path(spec["path"])
+        complete = p.is_file() or (p.is_dir() and (p / "_complete.txt").exists())
+        if not complete and not p.is_file() and spec.get("prep"):
+            if args.check:
+                print(f"AOI files not prepared yet: {p}\n"
+                      f"They will be downloaded and prepared when you run without --check.")
+                return 0
+            print(f"Preparing AOI '{aoi_name}' (first use; downloads, then deletes them) ...")
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "Data_Prep" / "AOI"))
+            from aoi_prep import prepare_aoi
+            prepare_aoi(spec["prep"], level, args.data_root)
+            complete = True
+        if not complete:
+            print(f"AOI not found or not fully prepared: {p}\n"
+                  f"Prepare it with Data_Prep/AOI/prepare_aoi.py (or aoi_prep.py) first.")
+            return 1
+        parts = aoi_parts(p)
+        if not parts:
+            print(f"No prepared AOI files in {p}")
+            return 1
+        geom_col, cover = aoi_file_info(parts[0])
+        if spec["id_column"] not in pq.read_schema(parts[0]).names or cover is None:
+            print(f"{parts[0]} is not a prepared AOI file (needs column '{spec['id_column']}' and a "
                   f"covering bbox). Run Data_Prep/AOI/prepare_aoi.py on it.")
             return 1
-        st = p.stat()
-        fingerprint = "poly_" + hashlib.md5(
-            f"{p.name}|{st.st_size}|{int(st.st_mtime)}|{spec['id_column']}".encode()).hexdigest()[:8]
-        aoi_desc = f"{pq.read_metadata(p).num_rows:,} polygons, id {spec['id_column']}  <- {p}"
+        sig = "|".join(f"{f.name}:{f.stat().st_size}:{int(f.stat().st_mtime)}" for f in parts)
+        fingerprint = "poly_" + hashlib.md5(f"{sig}|{spec['id_column']}".encode()).hexdigest()[:8]
+        n_poly = sum(pq.read_metadata(f).num_rows for f in parts)
+        aoi_desc = f"{n_poly:,} polygons in {len(parts)} file(s), id {spec['id_column']}  <- {p}"
 
-    out_dir = Path(args.output) / args.aoi
+    out_dir = Path(args.output) / aoi_name
     part_root = out_dir / f"_partials_{fingerprint}"
     settings = {"aoi": spec,
                 "farm_split_deg": config.FARMLAND_SPLIT_EXTENT_DEG,
                 "road_seg_deg": config.ROAD_MAX_SEGMENT_DEG}
 
     print("=" * 78)
-    print(f"FLOOD IMPACT  |  AOI {args.aoi}  |  label {label}  |  workers {args.workers}")
+    print(f"FLOOD IMPACT  |  AOI {aoi_name}  |  label {label}  |  workers {args.workers}")
     print(f"AOI      : {aoi_desc}")
     print(f"data root: {args.data_root}")
     print(f"output   : {out_dir}")
@@ -397,7 +435,7 @@ def main():
             pass
 
     print("Building output CSVs ...")
-    write_outputs(out_dir, part_root, args.aoi, spec, args.layers, label, config.SOURCES, planned)
+    write_outputs(out_dir, part_root, aoi_name, spec, args.layers, label, config.SOURCES, planned)
     print("=" * 78)
     return 0
 

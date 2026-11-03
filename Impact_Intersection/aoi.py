@@ -18,6 +18,7 @@ for a catchment set), and those are dropped.
 import json
 import math
 from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -128,31 +129,61 @@ def _overlaps(a, b):
     return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
 
 
+def aoi_parts(path):
+    """Prepared AOI files: the file itself, or every *.parquet in a folder
+    (e.g. one per GEOGLOWS VPU or HydroBASINS region)."""
+    p = Path(path)
+    if p.is_dir():
+        return sorted(f for f in p.glob("*.parquet") if not f.name.startswith(("_", ".")))
+    return [p]
+
+
+def _file_bbox(path):
+    md = pq.read_schema(path).metadata or {}
+    geo = json.loads(md[b'geo']) if b'geo' in md else {}
+    b = geo.get('columns', {}).get(geo.get('primary_column', 'geometry'), {}).get('bbox')
+    return tuple(b) if b and len(b) == 4 else None
+
+
+def _load_part(path, id_column, bbox):
+    """(ids, geoms) of one prepared file, limited to `bbox` (None = all)."""
+    if bbox is not None:
+        fb = _file_bbox(path)
+        if fb is not None and not _overlaps(fb, bbox):
+            return None
+    geom_col, cover = aoi_file_info(path)
+    pf = pq.ParquetFile(path)
+    md = pf.metadata
+    rgs = []
+    for rg in range(md.num_row_groups):
+        rb = _rg_bbox(md, rg, cover) if (cover and bbox) else None
+        if rb is None or _overlaps(rb, bbox):
+            rgs.append(rg)
+    if not rgs:
+        return None
+    t = pf.read_row_groups(rgs, columns=[id_column, geom_col])
+    if t.num_rows == 0:
+        return None
+    geoms = shapely.from_wkb(t.column(geom_col).to_numpy(zero_copy_only=False))
+    ids = t.column(id_column).to_numpy(zero_copy_only=False).astype(np.int64)
+    if bbox is not None:
+        gb = shapely.bounds(geoms)
+        keep = ~((gb[:, 2] < bbox[0]) | (gb[:, 0] > bbox[2]) |
+                 (gb[:, 3] < bbox[1]) | (gb[:, 1] > bbox[3]))
+        geoms, ids = geoms[keep], ids[keep]
+    return ids, geoms
+
+
 class PolygonAOI:
     def __init__(self, path, id_column, bbox=None):
-        """Load the AOI polygons whose bbox overlaps `bbox` (None = all)."""
-        geom_col, cover = aoi_file_info(path)
-        pf = pq.ParquetFile(path)
-        md = pf.metadata
-        rgs = []
-        for rg in range(md.num_row_groups):
-            rb = _rg_bbox(md, rg, cover) if (cover and bbox) else None
-            if rb is None or _overlaps(rb, bbox):
-                rgs.append(rg)
-        cols = [id_column, geom_col] + ([cover] if cover else [])
-        t = pf.read_row_groups(rgs, columns=cols) if rgs else None
-
-        if t is None or t.num_rows == 0:
-            self.ids, self.geoms = np.array([], np.int64), np.array([], dtype=object)
+        """Load the AOI polygons (from one prepared file or a folder of them)
+        whose bbox overlaps `bbox` (None = all)."""
+        loaded = [x for x in (_load_part(f, id_column, bbox) for f in aoi_parts(path)) if x]
+        if loaded:
+            self.ids = np.concatenate([x[0] for x in loaded])
+            self.geoms = np.concatenate([x[1] for x in loaded])
         else:
-            geoms = shapely.from_wkb(t.column(geom_col).to_numpy(zero_copy_only=False))
-            ids = t.column(id_column).to_numpy(zero_copy_only=False).astype(np.int64)
-            if bbox is not None:
-                gb = shapely.bounds(geoms)
-                keep = ~((gb[:, 2] < bbox[0]) | (gb[:, 0] > bbox[2]) |
-                         (gb[:, 3] < bbox[1]) | (gb[:, 1] > bbox[3]))
-                geoms, ids = geoms[keep], ids[keep]
-            self.ids, self.geoms = ids, geoms
+            self.ids, self.geoms = np.array([], np.int64), np.array([], dtype=object)
         shapely.prepare(self.geoms)          # makes repeated point tests fast
         self._tree = None
 
@@ -189,5 +220,5 @@ class PolygonAOI:
 # ---------------------------------------------------------------------------
 def make_aoi(spec, bbox=None):
     if spec["type"] == "h3":
-        return H3AOI(spec["resolution"])
+        return H3AOI(spec["level"])
     return PolygonAOI(spec["path"], spec["id_column"], bbox)

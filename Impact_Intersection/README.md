@@ -5,10 +5,13 @@ CSV for FEWS4All. The AOI is chosen per run: H3 cells, GEOGLOWS catchments, Hydr
 any polygon set you prepare.
 
 ```
-./run_impact.sh h3            # H3 cells (resolution in config.py)
-./run_impact.sh geoglows      # GEOGLOWS catchments
-./run_impact.sh hydrobasins --check
+./run_impact.sh h3 6            # H3 cells, resolution 6 (0-15; default 6)
+./run_impact.sh hydrobasins 8   # HydroBASINS level 8 (1-12; default 12)
+./run_impact.sh geoglows        # GEOGLOWS catchments (single level)
+./run_impact.sh hydrobasins 8 --check
 ```
+The number after the name is the level; leave it off for the default. GEOGLOWS and HydroBASINS
+polygons are downloaded and prepared the first time you use them (see `Data_Prep/AOI`).
 
 ## How it fits together
 1. **Prep once** (on the computation Mac, all under `DATA_ROOT`):
@@ -16,7 +19,8 @@ any polygon set you prepare.
    - `Data_Prep/Farmland/farmland_prep.sh` -> `Farmland/` (ESA WorldCover cropland blocks)
    - `Data_Prep/Population/population_prep.sh` -> `Population/worldpop_<year>_1km.parquet`
      (set the same year as `POPULATION_YEAR` in `config.py`)
-   - each polygon AOI set -> `AOI/<name>.parquet` with `Data_Prep/AOI/prepare_aoi.py`
+   - polygon AOIs -> `AOI/`: GEOGLOWS and HydroBASINS automatically on first use; any other
+     set with `Data_Prep/AOI/prepare_aoi.py`
 2. **Intersect** as often as needed: `./run_impact.sh <aoi>`. Changing the AOI never means
    re-prepping the exposure data.
 
@@ -25,20 +29,16 @@ any polygon set you prepare.
 - In `config.py` set `DATA_ROOT` and `OUTPUT_FOLDER`. AOI presets are in `AOIS`.
 - `chmod +x run_impact.sh` once.
 
-## Adding a polygon AOI
+## Adding another polygon AOI
 ```
-python ../Data_Prep/AOI/prepare_aoi.py INPUT ID_COLUMN $DATA_ROOT/AOI/<name>.parquet [--pattern GLOB]
+python ../Data_Prep/AOI/prepare_aoi.py INPUT ID_COLUMN ~/Flood_Impact_Model/Files/AOI/<name>.parquet [--pattern GLOB]
 ```
 INPUT is a file (GeoParquet, GPKG, shapefile, GeoJSON) or a folder of them; the id must be an
-integer. For the GEOGLOWS VPU layout:
-```
-python ../Data_Prep/AOI/prepare_aoi.py /path/GEOGLOW_Catchments LINKNO \
-    ~/Flood_Impact_Model/Files/AOI/geoglows_catchments.parquet --pattern "vpu=*/*.parquet"
-```
-Then add an entry to `AOIS` in `config.py` (copy the `geoglows` one).
+integer. Then add an entry to `AOIS` in `config.py` (copy `geoglows` and drop `"prep"`).
 
 ## Output
-`OUTPUT_FOLDER/<aoi>/impact_<aoi>_<YYYY-MM>.csv`, one row per AOI with any exposure
+`OUTPUT_FOLDER/<aoi>_<level>/impact_<aoi>_<level>_<YYYY-MM>.csv` (e.g. `h3_6/impact_h3_6_2026-11.csv`;
+`geoglows/impact_geoglows_2026-11.csv`), one row per AOI with any exposure
 (a missing AOI means zero), sorted by id:
 
 | Column | Unit | Meaning |

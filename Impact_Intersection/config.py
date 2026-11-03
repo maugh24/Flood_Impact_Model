@@ -9,8 +9,8 @@ files - lives under DATA_ROOT on the computation Mac:
         OSM_Prep/      Lines/  Polygons/  Points/   (Data_Prep/OSM/osm_prep.sh)
         Population/    worldpop_<year>_1km.parquet  (Data_Prep/Population/population_prep.sh)
         Farmland/      <tile>.parquet           (Data_Prep/Farmland/farmland_prep.sh)
-        AOI/           geoglows_catchments.parquet, hydrobasins.parquet, ...
-                       (Data_Prep/AOI/prepare_aoi.py)
+        AOI/           geoglows_catchments/, hydrobasins_lev<NN>/, ...
+                       (downloaded and prepared automatically on first use)
 
 Either can also be overridden on the command line:
     ./run_impact.sh h3 --data-root /other/Files --output /other/Results
@@ -45,31 +45,42 @@ INPUTS = {
 }
 
 # ---------------------------------------------------------------------------
-# Areas of interest: what the exposure is summed over. Pick one per run:
-#     ./run_impact.sh <name>
-# "h3"       -> H3 cells at a resolution (no file needed)
-# "polygons" -> a file made by Data_Prep/AOI/prepare_aoi.py, with an integer
-#               id column; its values become the first column of the CSV.
-# Add a new polygon set by preparing it and adding an entry here.
+# Areas of interest: what the exposure is summed over. Pick one per run, with
+# an optional level number:
+#     ./run_impact.sh h3 6             H3 resolution 6 (0-15)
+#     ./run_impact.sh hydrobasins 8    HydroBASINS level 8 (1-12)
+#     ./run_impact.sh geoglows         GEOGLOWS catchments (single level)
+# "h3"       -> H3 cells (no file needed)
+# "polygons" -> prepared polygon files with an integer id column; its values
+#               become the first column of the CSV. "path" may contain {level}.
+#               With "prep", missing files are downloaded and prepared
+#               automatically (Data_Prep/AOI/aoi_prep.py). For any other polygon
+#               set, prepare it with Data_Prep/AOI/prepare_aoi.py and add an
+#               entry without "prep".
 # ---------------------------------------------------------------------------
 AOIS = {
     "h3": {
         "type": "h3",
-        "resolution": 6,                                    # FEWS4All grid
+        "levels": range(0, 16),
+        "default_level": 6,                                 # FEWS4All grid
     },
     "geoglows": {
         "type": "polygons",
-        "path": "AOI/geoglows_catchments.parquet",
+        "prep": "geoglows",
+        "path": "AOI/geoglows_catchments",
         "id_column": "LINKNO",
         "description": "GEOGLOWS river reach id (LINKNO) of the catchment",
-        "source": "GEOGLOWS catchments (all VPUs)",
+        "source": "GEOGLOWS v2 catchments (all VPUs)",
     },
     "hydrobasins": {
         "type": "polygons",
-        "path": "AOI/hydrobasins.parquet",
+        "prep": "hydrobasins",
+        "path": "AOI/hydrobasins_lev{level:02d}",
+        "levels": range(1, 13),
+        "default_level": 12,
         "id_column": "HYBAS_ID",
-        "description": "HydroBASINS basin id (HYBAS_ID)",
-        "source": "HydroBASINS",
+        "description": "HydroBASINS basin id (HYBAS_ID), level {level}",
+        "source": "HydroBASINS v1c standard",
     },
 }
 
