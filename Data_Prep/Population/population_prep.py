@@ -35,6 +35,13 @@ import rasterio
 import shapely
 from rasterio.windows import Window
 
+# Name sent with every download (servers can refuse generic client names).
+USER_AGENT = "FloodImpactModel/1.0"
+
+
+def _request(url):
+    return urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+
 # WorldPop "Global2" R2025A mosaics. {year} is filled in; override with --url
 # if WorldPop moves the file.
 TIF_NAME = "global_pop_{year}_CN_1km_R2025A_UA_v1.tif"
@@ -51,7 +58,7 @@ def download(url, dest, tries=4):
     for attempt in range(1, tries + 1):
         try:
             print(f"downloading {url}", flush=True)
-            with urllib.request.urlopen(url, timeout=120) as r, open(part, "wb") as f:
+            with urllib.request.urlopen(_request(url), timeout=120) as r, open(part, "wb") as f:
                 expected = int(r.headers.get("Content-Length", -1))
                 got, last = 0, time.time()
                 while chunk := r.read(8 << 20):

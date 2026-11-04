@@ -61,6 +61,11 @@ KEEP_PBF="${KEEP_PBF:-0}"
 SORT_BY_BBOX="${SORT_BY_BBOX:-YES}"
 
 GEOFABRIK_URL="${GEOFABRIK_URL:-https://download.geofabrik.de}"
+
+# Name sent with every download. Geofabrik answers curl's default name
+# ("curl/8.x") with 404 for its largest files (europe), but redirects
+# a named application to the right download server.
+USER_AGENT="FloodImpactModel/1.0"
 PYTHON="${PYTHON:-python}"   # use $PYTHON if already set, otherwise "python"
 
 # Features kept. Roads/rail are the same lists the H3 impact code counts;
@@ -143,7 +148,7 @@ download_region() {
     # (`if ! command` is how bash lets a command fail without set -e stopping.)
     local got_md5=0 try
     for try in 1 2 3; do
-        if run curl --fail --location --silent --show-error -o "$pbf.md5" "$url.md5"; then
+        if run curl --fail --location --silent --show-error -A "$USER_AGENT" -o "$pbf.md5" "$url.md5"; then
             got_md5=1
             break
         fi
@@ -155,7 +160,7 @@ download_region() {
         log "$region: downloading WITHOUT an MD5 check (the conversion and validation still catch a broken file)"
     fi
     # --continue-at - resumes a half-finished download instead of restarting.
-    run curl --fail --location --retry 5 --continue-at - -o "$pbf.part" "$url"
+    run curl --fail --location --retry 5 --continue-at - -A "$USER_AGENT" -o "$pbf.part" "$url"
     run mv "$pbf.part" "$pbf"
 
     if [[ "${DRY_RUN:-0}" != "1" && -f "$pbf.md5" ]] && ! pbf_ok "$region"; then

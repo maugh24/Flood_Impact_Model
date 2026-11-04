@@ -30,6 +30,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from prepare_aoi import prepare                    # noqa: E402
 
+# Name sent with every download (servers can refuse generic client names).
+USER_AGENT = "FloodImpactModel/1.0"
+
+
+def _request(url):
+    return urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+
 GEOGLOWS_BUCKET = "https://geoglows-v2.s3.us-west-2.amazonaws.com"
 GEOGLOWS_PREFIX = "hydrography/"
 HYDROBASINS_URL = "https://data.hydrosheds.org/file/hydrobasins/standard/hybas_{region}_lev01-12_v1c.zip"
@@ -61,7 +68,7 @@ def download(url, dest, tries=4):
     part = dest.with_name(dest.name + ".partial")
     for attempt in range(1, tries + 1):
         try:
-            with urllib.request.urlopen(url, timeout=120) as r, open(part, "wb") as f:
+            with urllib.request.urlopen(_request(url), timeout=120) as r, open(part, "wb") as f:
                 expected = int(r.headers.get("Content-Length", -1))
                 while chunk := r.read(8 << 20):
                     f.write(chunk)
@@ -83,7 +90,7 @@ def s3_folders(bucket, prefix):
         q = {"list-type": "2", "prefix": prefix, "delimiter": "/"}
         if token:
             q["continuation-token"] = token
-        with urllib.request.urlopen(f"{bucket}/?{urllib.parse.urlencode(q)}", timeout=60) as r:
+        with urllib.request.urlopen(_request(f"{bucket}/?{urllib.parse.urlencode(q)}"), timeout=60) as r:
             root = ET.fromstring(r.read())
         out += [p.text for p in root.iter(f"{S3_NS}Prefix") if p.text and p.text != prefix]
         if root.findtext(f"{S3_NS}IsTruncated") != "true":

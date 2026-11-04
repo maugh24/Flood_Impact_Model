@@ -48,6 +48,13 @@ import rasterio
 import shapely
 from rasterio.windows import Window
 
+# Name sent with every download (servers can refuse generic client names).
+USER_AGENT = "FloodImpactModel/1.0"
+
+
+def _request(url):
+    return urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+
 BUCKET_URL = "https://esa-worldcover.s3.eu-central-1.amazonaws.com"
 PREFIX = "v200/2021/map/"
 CROPLAND_CLASS = 40
@@ -87,7 +94,7 @@ def list_tiles(cache, refresh=False):
         if token:
             q["continuation-token"] = token
         url = f"{BUCKET_URL}/?{urllib.parse.urlencode(q)}"
-        with urllib.request.urlopen(url, timeout=60) as r:
+        with urllib.request.urlopen(_request(url), timeout=60) as r:
             root = ET.fromstring(r.read())
         for key in root.iter(f"{S3_NS}Key"):
             m = TILE_RE.search(key.text)
@@ -110,7 +117,7 @@ def download(code, dest, tries=4):
     part = dest.with_name(dest.name + ".partial")
     for attempt in range(1, tries + 1):
         try:
-            with urllib.request.urlopen(url, timeout=120) as r, open(part, "wb") as f:
+            with urllib.request.urlopen(_request(url), timeout=120) as r, open(part, "wb") as f:
                 expected = int(r.headers.get("Content-Length", -1))
                 while chunk := r.read(8 << 20):
                     f.write(chunk)
