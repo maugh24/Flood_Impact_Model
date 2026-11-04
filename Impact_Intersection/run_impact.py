@@ -141,6 +141,11 @@ def plan_layer(layer, data_root, target_rows):
             print(f"  [{layer}] cannot read {f}: {err}")
             continue
         rel = rel_of[f]
+        # The file's size and modification time are part of each task id, so a
+        # rebuilt input (e.g. a fresher africa-lines.parquet under the same
+        # name) gets new tasks instead of reusing results from the old file.
+        st = f.stat()
+        rel = f"{rel}@{st.st_size}:{int(st.st_mtime)}"
         cur = []
         for rg, n in enumerate(rg_rows):
             cur.append(rg)
@@ -240,6 +245,14 @@ def merge_layer(part_dir, columns, task_ids, batch_rows=5_000_000):
     return total[columns]
 
 
+def write_csv_atomic(df, path):
+    """Write to a temporary name, then rename: a crash mid-write never leaves a
+    cut-off CSV under the real name (the rename happens all at once)."""
+    tmp = Path(f"{path}.tmp")
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, path)
+
+
 def write_outputs(out_dir, part_root, aoi_name, spec, layers, label, sources, planned):
     stem = f"impact_{aoi_name}_{label}"
     frames = []
@@ -268,12 +281,12 @@ def write_outputs(out_dir, part_root, aoi_name, spec, layers, label, sources, pl
         rounded.insert(0, id_col, rounded.index.astype(np.int64))
 
     main_csv = out_dir / f"{stem}.csv"
-    rounded.to_csv(main_csv, index=False)
+    write_csv_atomic(rounded, main_csv)
 
     summary = {"aoi_count": [len(rounded)]}      # AOIs (cells/basins) with any exposure
     for c in cols:
         summary[c] = [round(float(totals[c]), DECIMALS[c]) if DECIMALS[c] else int(round(totals[c]))]
-    pd.DataFrame(summary).to_csv(out_dir / f"{stem}_summary.csv", index=False)
+    write_csv_atomic(pd.DataFrame(summary), out_dir / f"{stem}_summary.csv")
 
     run_date = datetime.now().strftime("%Y-%m-%d")
     meta = []
@@ -283,7 +296,7 @@ def write_outputs(out_dir, part_root, aoi_name, spec, layers, label, sources, pl
         unit, desc = COLUMN_INFO[c]
         meta.append({"column": c, "unit": unit, "description": desc,
                      "source": sources.get(c, ""), "aoi": aoi_name, "run_date": run_date})
-    pd.DataFrame(meta).to_csv(out_dir / f"{stem}_metadata.csv", index=False)
+    write_csv_atomic(pd.DataFrame(meta), out_dir / f"{stem}_metadata.csv")
 
     print(f"  wrote {main_csv} ({len(rounded):,} cells)")
     print(pd.DataFrame(summary).to_string(index=False))
@@ -404,6 +417,13 @@ def main():
 
     for layer in args.layers:
         (part_root / layer).mkdir(parents=True, exist_ok=True)
+        # Half-written partials from a run that was killed mid-save: they were
+        # never renamed to .csv, so their tasks are redone; just tidy them up.
+        for stale in (part_root / layer).glob("*.tmp"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
 
     failed = []
     if all_tasks and not args.merge_only:

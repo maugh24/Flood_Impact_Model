@@ -5,13 +5,14 @@
 #
 # For each region:
 #   1. download  <region>-latest.osm.pbf from Geofabrik and check its MD5
+#                (if Geofabrik has no .md5 at that moment, download unchecked)
 #   2. convert   one ogr2ogr call per layer (lines, multipolygons):
 #                read the .pbf directly, keep only flood-impact features,
 #                write GeoParquet with a bbox column, sorted by location
 #   3. validate  read every row group of the new file (validate_parquet.py)
 #   4. checksum  write <file>.sha256 so copies can be verified later
 #
-# Usage (from this folder, in the hydroinformatics environment):
+# Usage (from this folder, in the flood_impact environment):
 #   ./osm_prep.sh                      # all regions in REGIONS below
 #   ./osm_prep.sh central-america      # just one (or several) regions
 #   ./osm_prep.sh /path/to/asia-261029.osm.pbf
@@ -20,7 +21,9 @@
 #                                      # asia-261029-lines.parquet, ...
 #   DRY_RUN=1 ./osm_prep.sh asia       # print the commands, run nothing
 #
-# Safe to rerun: finished steps are skipped.
+# Each region runs as its own process: if one fails, the others still run,
+# and the failed ones are listed at the end. Safe to rerun: finished steps
+# are skipped.
 # =============================================================================
 
 # Stop on the first error (-e), on use of an unset variable (-u), and if any
@@ -57,7 +60,7 @@ KEEP_PBF="${KEEP_PBF:-0}"
 # for Asia/Europe). NO = no temporary copy; the H3 run gives identical results.
 SORT_BY_BBOX="${SORT_BY_BBOX:-YES}"
 
-GEOFABRIK_URL="https://download.geofabrik.de"
+GEOFABRIK_URL="${GEOFABRIK_URL:-https://download.geofabrik.de}"
 PYTHON="${PYTHON:-python}"   # use $PYTHON if already set, otherwise "python"
 
 # Features kept. Roads/rail are the same lists the H3 impact code counts;
@@ -135,12 +138,27 @@ download_region() {
     log "$region: downloading $url"
     # Fetch the checksum first: Geofabrik rebuilds extracts daily, and the
     # .md5 must belong to the same build as the .pbf we download right after.
-    run curl --fail --location --silent --show-error -o "$pbf.md5" "$url.md5"
+    # It is occasionally missing for a while (europe gave "404" once), so try
+    # a few times, then carry on without it rather than skip the region.
+    # (`if ! command` is how bash lets a command fail without set -e stopping.)
+    local got_md5=0 try
+    for try in 1 2 3; do
+        if run curl --fail --location --silent --show-error -o "$pbf.md5" "$url.md5"; then
+            got_md5=1
+            break
+        fi
+        log "$region: checksum not available (attempt $try of 3)"
+        if [[ "$try" -lt 3 ]]; then sleep "${MD5_RETRY_WAIT:-60}"; fi
+    done
+    if [[ "$got_md5" != "1" ]]; then
+        rm -f "$pbf.md5"
+        log "$region: downloading WITHOUT an MD5 check (the conversion and validation still catch a broken file)"
+    fi
     # --continue-at - resumes a half-finished download instead of restarting.
     run curl --fail --location --retry 5 --continue-at - -o "$pbf.part" "$url"
     run mv "$pbf.part" "$pbf"
 
-    if [[ "${DRY_RUN:-0}" != "1" ]] && ! pbf_ok "$region"; then
+    if [[ "${DRY_RUN:-0}" != "1" && -f "$pbf.md5" ]] && ! pbf_ok "$region"; then
         log "$region: MD5 MISMATCH - the download is damaged or Geofabrik updated mid-download."
         log "$region: delete $pbf and rerun."
         return 1
@@ -215,8 +233,34 @@ fi
 
 mkdir -p "$PBF_DIR" "$TMP_DIR" "$WORK_DIR/Lines" "$WORK_DIR/Polygons" "$WORK_DIR/Points"
 
-log "OSM prep -> $WORK_DIR"
-log "regions: $regions"
+# ----------------------------------------------------------------------------
+# More than one region: run each in its own process, so a failure in one
+# (a missing download, say) doesn't stop the rest. Inside each process
+# `set -e` works normally, so a broken step still stops THAT region before
+# anything bad is kept.
+# ----------------------------------------------------------------------------
+if [[ "${OSM_PREP_ONE_REGION:-0}" != "1" ]]; then
+    log "OSM prep -> $WORK_DIR"
+    log "regions: $regions"
+    failed=""
+    for item in $regions; do
+        if ! OSM_PREP_ONE_REGION=1 bash "$SCRIPT_DIR/osm_prep.sh" "$item"; then
+            failed="$failed $item"
+            log "$item: FAILED - continuing with the next region"
+        fi
+    done
+    if [[ -n "$failed" ]]; then
+        log "finished, but these region(s) failed:$failed"
+        log "rerun just those with:  ./osm_prep.sh$failed"
+        exit 1
+    fi
+    log "all done"
+    exit 0
+fi
+
+# ----------------------------------------------------------------------------
+# One region (we are the per-region process started above)
+# ----------------------------------------------------------------------------
 for item in $regions; do
     if [[ "$item" == *.pbf ]]; then
         # A file path: skip the download and name outputs after the file,
@@ -243,5 +287,5 @@ for item in $regions; do
         run rm -f "$pbf" "$pbf.md5"
     fi
     rm -rf "${TMP_DIR:?}"/*      # GDAL scratch from this region
+    log "$name: done"
 done
-log "all done"

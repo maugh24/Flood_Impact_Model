@@ -27,7 +27,10 @@ DRY_RUN=1 ./osm_prep.sh antarctica   # print the commands only
 ```
 A file path skips the download and MD5 check; outputs are named after the file
 (`asia-261029-lines.parquet`, `asia-261029-polygons.parquet`).
-Rerunning skips finished conversions. Output goes to `WORK_DIR`
+Each region runs as its own process: if one fails (e.g. a download error), the rest still
+run, and the end of the log lists the failed ones with the command to rerun just those. If
+Geofabrik's `.md5` checksum is missing at that moment, the region is downloaded without it
+(conversion and validation still catch a broken file). Rerunning skips finished conversions. Output goes to `WORK_DIR`
 (default `Files/OSM_Prep`, override with `WORK_DIR=/path ./osm_prep.sh ...`):
 `Lines/`, `Polygons/`, `Points/`. Only these GeoParquet files are kept: each region's
 downloaded `.pbf` is deleted once all three layers are converted and validated

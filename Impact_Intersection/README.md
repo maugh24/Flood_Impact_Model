@@ -60,6 +60,10 @@ Features outside every polygon (e.g. offshore for catchments) are not counted.
   finished tasks. `<id>` changes when the AOI changes (H3 resolution, or a re-prepared polygon
   file), so results for an old AOI version are never mixed in.
 - Only partials for the current input files are merged; a partial missing a newer column is redone.
+  Each task id includes its input file's size and modification time, so rebuilding an input
+  (e.g. fresher OSM for one region) redoes just the tasks that read it.
+- Final CSVs are written under a temporary name and then renamed, so a crash never leaves a
+  cut-off `impact_*.csv`. Ctrl+C or a crash only loses the tasks that were in progress.
 - Read errors (e.g. a sleeping external drive) are retried twice per task.
 - A log of each run is saved in `logs/`.
 
