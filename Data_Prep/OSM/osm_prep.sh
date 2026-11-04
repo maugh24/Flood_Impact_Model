@@ -273,6 +273,15 @@ for item in $regions; do
         log "$name: using $pbf"
     else
         name="$item"
+        # All three layers already finished? Then don't download the region again.
+        done_all=1
+        for f in "Lines/$name-lines" "Polygons/$name-polygons" "Points/$name-points"; do
+            [[ -f "$WORK_DIR/$f.parquet" && -f "$WORK_DIR/$f.parquet.sha256" ]] || done_all=0
+        done
+        if [[ "$done_all" == "1" ]]; then
+            log "$name: all layers already converted, skipping (no download)"
+            continue
+        fi
         download_region "$name"
         pbf="$PBF_DIR/$name-latest.osm.pbf"
     fi
