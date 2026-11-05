@@ -271,9 +271,11 @@ def _roads_table(t, geom_col, crs, path, s, aoi):
         bridge_cells = np.array([], np.int64)
     parts, idx = shapely.get_parts(geoms, return_index=True)
     is_line = np.isin(shapely.get_type_id(parts), [1, 2])     # LineString / LinearRing
-    # Drop degenerate lines with fewer than 2 points (occur in raw OSM data);
-    # they have no length and make shapely.segmentize raise.
+    # Drop degenerate lines (occur in raw OSM data): fewer than 2 points, or
+    # every point in the same spot. They have no length, and shapely.segmentize
+    # raises on them ("point array must contain 0 or >1 elements").
     is_line &= shapely.get_num_coordinates(parts) >= 2
+    is_line &= shapely.length(parts) > 0
     parts, idx = parts[is_line], idx[is_line]
     if len(parts) == 0:
         return sum_by_aoi(bridge_cells, transportation_km=np.zeros(len(bridge_cells)),
